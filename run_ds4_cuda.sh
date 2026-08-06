@@ -3,6 +3,37 @@ set -euo pipefail
 
 cd /mnt/c/Users/gmart/OneDrive/ds4
 
+# This launcher is intentionally pinned to the recovered CUDA build.  A pull,
+# rebuild, or accidental switch to another experimental backend must not be
+# started under the definitive profile without being verified first.
+readonly DS4_RECOVERED_CUDA_BLOB="8738c02670b968a6a647c8980890746fe80edf4e"
+readonly DS4_RECOVERED_BINARY_SHA256="42eed1051a6c4279bbc06c47228465be3f7456ed84617234e6337d54fc3d0a11"
+
+if ! command -v git >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
+    printf 'DS4 recovered guard: git and sha256sum are required.\n' >&2
+    exit 126
+fi
+
+# The shared Windows worktree uses CRLF while the preserved Git blob uses LF.
+# Normalize only line endings before hashing so Windows Git and WSL Git agree.
+actual_cuda_blob="$(tr -d '\r' < ds4_cuda.cu | git hash-object --stdin 2>/dev/null || true)"
+actual_binary_sha256="$(sha256sum ./ds4 2>/dev/null | awk '{print $1}')"
+if [[ "$actual_cuda_blob" != "$DS4_RECOVERED_CUDA_BLOB" ||
+      "$actual_binary_sha256" != "$DS4_RECOVERED_BINARY_SHA256" ]]; then
+    printf '%s\n' \
+        'DS4 recovered guard: refusing to launch an unapproved build.' \
+        "  expected CUDA blob: $DS4_RECOVERED_CUDA_BLOB" \
+        "  actual CUDA blob:   ${actual_cuda_blob:-unavailable}" \
+        "  expected binary:    $DS4_RECOVERED_BINARY_SHA256" \
+        "  actual binary:      ${actual_binary_sha256:-unavailable}" >&2
+    exit 126
+fi
+
+if [[ "${1:-}" == "--verify-recovered" ]]; then
+    printf 'DS4 recovered guard: verified %s\n' "$DS4_RECOVERED_CUDA_BLOB"
+    exit 0
+fi
+
 export CUDA_HOME=/home/peppe200175/.local/cuda-13.3.1
 export PATH=/home/peppe200175/.local/cuda-13.3.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LD_LIBRARY_PATH=/home/peppe200175/.local/cuda-13.3.1/lib64
