@@ -274,6 +274,14 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--logprobs-top-k N", "Alternatives stored by --dump-logprobs. Default: 20");
     opt(fp, c, "--decode-consistency N", "Compare N-token decode logits with a fresh full prefill.");
     opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");
+    opt(fp, c, "DS4_EXPERT_TRACE=FILE", "CUDA SSD streaming: JSONL prompt, routed experts, weights, and before/after cache state.");
+    opt(fp, c, "DS4_CUDA_PROMPT_EXPERT_CACHE=1", "CUDA SSD streaming: experimental prompt/session-aware expert admission and early-decode protection.");
+    opt(fp, c, "DS4_CUDA_PINNED_EXPERTS_FILE=FILE", "CUDA SSD streaming: pin up to two profiled experts per layer after their first use.");
+    opt(fp, c, "DS4_CUDA_STREAMING_READ_THREADS=N", "CUDA SSD streaming: parallel direct-I/O expert reads (1-4; use 4 on fast NVMe).");
+    opt(fp, c, "DS4_CUDA_STREAMING_SMALL_MISS_PARALLEL=1", "CUDA SSD streaming: use available readers for small gate/up/down miss groups.");
+    opt(fp, c, "DS4_CUDA_STREAMING_PERSISTENT_READERS=1", "CUDA SSD streaming: reuse direct-I/O reader threads between expert misses.");
+    opt(fp, c, "DS4_CUDA_DECODE_CACHE_LRU=1", "CUDA SSD streaming: use layer-local LRU replacement during decode.");
+    opt(fp, c, "DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP=1", "CUDA SSD streaming: overlap selected-batch loading with the shared expert (experimental).");
     opt(fp, c, "--perplexity-file FILE", "Score raw text with teacher-forced NLL.");
     opt(fp, c, "--imatrix-dataset FILE", "Rendered prompt dataset for imatrix collection.");
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");

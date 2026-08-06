@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.7
+ARG CUDA_VERSION=12.8.1
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# CUDA 12.8 is the first production toolkit with Blackwell support. The
+# Makefile maps sm_120 to compute_120a/sm_120a and enables the MXF4 kernels.
+RUN make cuda \
+        CUDA_ARCH=sm_120 \
+        CUDA_HOME=/usr/local/cuda \
+        -j"$(nproc)"
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04 AS runtime-base
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends bash ca-certificates less procps && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/ds4
+COPY --from=build /src/ds4 /src/ds4-server /src/ds4-bench \
+    /src/ds4-eval /src/ds4-agent ./
+COPY --from=build /src/profiles ./profiles
+COPY --from=build /src/LICENSE /src/README.md ./
+COPY docker/ds4-run.sh /usr/local/bin/ds4-run
+RUN chmod 0755 /usr/local/bin/ds4-run && mkdir -p /models
+
+ENV DS4_MODEL=/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+    DS4_CUDA_MMQ=0 \
+    DS4_CUDA_NO_Q8_F16_CACHE=1 \
+    DS4_CUDA_STREAMING_READ_THREADS=4 \
+    DS4_CUDA_STREAMING_SMALL_MISS_PARALLEL=1 \
+    DS4_CUDA_STREAMING_PERSISTENT_READERS=1 \
+    DS4_CUDA_DECODE_CACHE_LRU=1 \
+    DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP=0 \
+    DS4_CUDA_PROMPT_EXPERT_CACHE=0 \
+    DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=256 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+LABEL org.opencontainers.image.title="DwarfStar 4 CUDA" \
+      org.opencontainers.image.description="DeepSeek V4 Flash 0731 GA with CUDA SSD expert streaming" \
+      org.opencontainers.image.revision="b030961-local" \
+      ai.dwarfstar.model="DeepSeek-V4-Flash-0731-GA-IQ2XXS"
+
+CMD ["bash"]
+
+FROM runtime-base AS atomic
+
+# `model` is a BuildKit named context. Keeping the GGUF in its own immutable
+# layer makes later source-only layers cacheable. On Docker Desktop versions
+# that cannot ingest an 86.7 GB named context reliably, build `runtime-base`,
+# copy the GGUF into a staging container, and commit that container instead.
+COPY --from=model /DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+    /models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+RUN test -s /models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf

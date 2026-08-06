@@ -4675,6 +4675,7 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
     table.model_map = model->map;
     table.model_size = model->size;
     table.layer = il;
+    table.n_layer = DS4_N_LAYER;
     table.n_total_expert = DS4_N_EXPERT;
     table.gate_offset = layer->ffn_gate_exps ? layer->ffn_gate_exps->abs_offset : 0;
     table.up_offset = layer->ffn_up_exps ? layer->ffn_up_exps->abs_offset : 0;
@@ -15239,6 +15240,28 @@ typedef struct {
     double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
+    /* Identifies the public prompt sync that owns subsequent MoE routing
+     * events when DS4_EXPERT_TRACE is enabled. */
+    uint64_t expert_trace_session_id;
+    uint64_t expert_trace_prompt_id;
+#if !defined(DS4_ROCM_BUILD) && !defined(__APPLE__)
+    bool expert_trace_pending_decode;
+    uint32_t expert_trace_pending_layer;
+    uint32_t expert_trace_pending_position;
+    int32_t expert_trace_pending_selected[DS4_MAX_EXPERT_USED];
+    float expert_trace_pending_weights[DS4_MAX_EXPERT_USED];
+    ds4_gpu_stream_expert_cache_snapshot expert_trace_pending_cache_before;
+    bool expert_trace_prefill_cache_before_valid;
+    uint32_t expert_trace_prefill_layer;
+    uint32_t expert_trace_prefill_position;
+    uint32_t expert_trace_prefill_tokens;
+    ds4_gpu_stream_expert_cache_snapshot expert_trace_prefill_cache_before;
+    bool expert_trace_last_valid;
+    uint64_t expert_trace_last_prompt_id;
+    uint32_t expert_trace_last_layer;
+    uint32_t expert_trace_last_position;
+    uint32_t expert_trace_last_tokens;
+#endif
     /* Metal-only prefill helpers retained alongside the CUDA tiered workspace. */
     ds4_gpu_tensor *batch_q_half;
     ds4_gpu_tensor *prefill_seed_router_selected;
@@ -15267,6 +15290,325 @@ typedef struct {
     ds4_gpu_tensor *tp_zero;
     ds4_gpu_tensor *tp_logits_half;
 } ds4_gpu_graph;
+
+/* =========================================================================
+ * Optional prompt / routed-expert / CUDA streaming-cache JSONL trace.
+ * =========================================================================
+ *
+ * DS4_EXPERT_TRACE=/path/to/file.jsonl enables this deliberately verbose
+ * diagnostic.  It is off by default because it records complete rendered
+ * prompts and one routing record for every sparse layer and token. CUDA's
+ * selected/shared overlap is disabled while tracing so before/after cache
+ * snapshots describe one complete, synchronous load transaction.
+ */
+
+typedef struct ds4_expert_trace_state {
+    pthread_mutex_t mutex;
+    FILE            *fp;
+    int              initialized;
+    uint64_t         next_sequence;
+    uint64_t         next_session_id;
+} ds4_expert_trace_state;
+
+static ds4_expert_trace_state g_expert_trace = {
+    PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, 0
+};
+
+static FILE *ds4_expert_trace_open_locked(void) {
+    if (g_expert_trace.initialized) return g_expert_trace.fp;
+    g_expert_trace.initialized = 1;
+    const char *path = getenv("DS4_EXPERT_TRACE");
+    if (!path || !path[0]) return NULL;
+    g_expert_trace.fp = fopen(path, "ab");
+    if (!g_expert_trace.fp) {
+        fprintf(stderr,
+                "ds4: cannot open expert trace '%s': %s\n",
+                path, strerror(errno));
+        return NULL;
+    }
+    setvbuf(g_expert_trace.fp, NULL, _IOLBF, 0);
+    fprintf(g_expert_trace.fp,
+            "{\"event\":\"trace_start\",\"schema\":1,"
+            "\"sequence\":%" PRIu64 ",\"pid\":%ld,"
+            "\"cache_semantics\":\"cuda_layer_partitioned_persistent_with_optional_prompt_policy\"}\n",
+            ++g_expert_trace.next_sequence,
+            (long)getpid());
+    fflush(g_expert_trace.fp);
+    fprintf(stderr,
+            "ds4: expert trace enabled at %s (contains complete prompts)\n",
+            path);
+    return g_expert_trace.fp;
+}
+
+static bool ds4_expert_trace_enabled(void) {
+    bool enabled;
+    pthread_mutex_lock(&g_expert_trace.mutex);
+    enabled = ds4_expert_trace_open_locked() != NULL;
+    pthread_mutex_unlock(&g_expert_trace.mutex);
+    return enabled;
+}
+
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+static int ds4_expert_trace_cache_slot(
+        const ds4_gpu_stream_expert_cache_snapshot *s,
+        uint32_t layer,
+        int32_t expert) {
+    if (!s || !s->valid || s->layer != layer) return -1;
+    for (uint32_t i = 0; i < s->compact_ids_count; i++) {
+        if (s->compact_ids[i] == expert) return (int)i;
+    }
+    return -1;
+}
+
+static int ds4_expert_trace_persistent_request_slot(
+        const ds4_gpu_stream_expert_cache_snapshot *s,
+        uint32_t layer,
+        int32_t expert,
+        bool *hit) {
+    if (hit) *hit = false;
+    if (!s || !s->valid || s->layer != layer) return -1;
+    for (uint32_t i = 0; i < s->compact_ids_count; i++) {
+        if (s->compact_ids[i] != expert) continue;
+        if (hit) *hit = s->compact_persistent_hits[i] != 0;
+        return s->compact_persistent_slots[i];
+    }
+    return -1;
+}
+
+static void ds4_expert_trace_write_cache_snapshot(
+        FILE *fp,
+        const ds4_gpu_stream_expert_cache_snapshot *s) {
+    fprintf(fp,
+            "{\"valid\":%s,\"logical_tier\":%d,\"layer\":%u,"
+            "\"total_experts\":%u,\"requested_slots\":%u,"
+            "\"unique_experts\":%u,\"weight_offsets\":{"
+            "\"gate\":%" PRIu64 ",\"up\":%" PRIu64
+            ",\"down\":%" PRIu64 "},\"bytes_per_expert\":{"
+            "\"gate\":%" PRIu64 ",\"up\":%" PRIu64
+            ",\"down\":%" PRIu64 "},\"allocation_capacity_bytes\":{"
+            "\"gate\":%" PRIu64 ",\"up\":%" PRIu64
+            ",\"down\":%" PRIu64 ",\"selected_remap\":%" PRIu64
+            "},\"live_bytes\":{\"weights\":%" PRIu64
+            ",\"selected_remap\":%" PRIu64 "},\"load_generation\":%" PRIu64
+            ",\"total_loads\":%" PRIu64
+            ",\"total_loaded_experts\":%" PRIu64
+            ",\"total_bytes_copied\":%" PRIu64
+            ",\"last_bytes_copied\":%" PRIu64
+            ",\"last_allocation_reused\":{\"gate\":%s,\"up\":%s,"
+            "\"down\":%s,\"selected_remap\":%s},"
+            "\"persistent\":{\"capacity_experts\":%u,"
+            "\"resident_experts\":%u,\"bytes\":%" PRIu64
+            ",\"layer_capacity\":%u,\"layer_resident\":%u,"
+            "\"hits\":%" PRIu64 ",\"misses\":%" PRIu64
+            ",\"evictions\":%" PRIu64 ",\"insertions\":%" PRIu64
+            ",\"model_bytes_read\":%" PRIu64
+            ",\"cache_hit_bytes\":%" PRIu64
+            ",\"last_hits\":%u,\"last_misses\":%u,"
+            "\"last_evictions\":%u,\"last_insertions\":%u,"
+            "\"last_model_bytes_read\":%" PRIu64
+            ",\"last_cache_hit_bytes\":%" PRIu64
+            ",\"prompt_policy\":{\"enabled\":%s,\"phase\":%u,"
+            "\"prompt_generation\":%" PRIu64
+            ",\"decode_token\":%" PRIu64
+            ",\"prompt_protected_resident\":%u,"
+            "\"session_protected_resident\":%u,"
+            "\"prefill_probation_admissions\":%" PRIu64
+            ",\"prefill_single_use_bypasses\":%" PRIu64
+            ",\"decode_reserve_admissions\":%" PRIu64
+            ",\"protected_victim_skips\":%" PRIu64
+            ",\"prompt_protected_hits\":%" PRIu64
+            ",\"session_protected_hits\":%" PRIu64
+            ",\"last_prefill_probation_admissions\":%u,"
+            "\"last_prefill_single_use_bypasses\":%u,"
+            "\"last_decode_reserve_admissions\":%u,"
+            "\"last_protected_victim_skips\":%u},"
+            "\"pinned_policy\":{\"enabled\":%s,"
+            "\"profile_experts\":%u,\"resident_experts\":%u,"
+            "\"hits\":%" PRIu64 ",\"admissions\":%" PRIu64
+            ",\"victim_skips\":%" PRIu64 ","
+            "\"last_hits\":%u,\"last_admissions\":%u,"
+            "\"last_victim_skips\":%u},"
+            "\"layer_experts\":[",
+            s->valid ? "true" : "false",
+            s->logical_tier,
+            s->layer,
+            s->n_total_expert,
+            s->slot_count,
+            s->compact_count,
+            s->gate_offset,
+            s->up_offset,
+            s->down_offset,
+            s->gate_expert_bytes,
+            s->gate_expert_bytes,
+            s->down_expert_bytes,
+            s->gate_capacity,
+            s->up_capacity,
+            s->down_capacity,
+            s->selected_capacity,
+            s->live_weight_bytes,
+            s->live_remap_bytes,
+            s->load_generation,
+            s->total_loads,
+            s->total_loaded_experts,
+            s->total_bytes_copied,
+            s->last_bytes_copied,
+            s->last_gate_allocation_reused ? "true" : "false",
+            s->last_up_allocation_reused ? "true" : "false",
+            s->last_down_allocation_reused ? "true" : "false",
+            s->last_selected_allocation_reused ? "true" : "false",
+            s->persistent_capacity_experts,
+            s->persistent_resident_experts,
+            s->persistent_bytes,
+            s->persistent_layer_capacity,
+            s->persistent_layer_resident,
+            s->persistent_hits,
+            s->persistent_misses,
+            s->persistent_evictions,
+            s->persistent_insertions,
+            s->persistent_model_bytes_read,
+            s->persistent_cache_hit_bytes,
+            s->last_persistent_hits,
+            s->last_persistent_misses,
+            s->last_persistent_evictions,
+            s->last_persistent_insertions,
+            s->last_model_bytes_read,
+            s->last_cache_hit_bytes,
+            s->prompt_policy_enabled ? "true" : "false",
+            s->prompt_policy_phase,
+            s->prompt_generation,
+            s->decode_token,
+            s->prompt_protected_resident,
+            s->session_protected_resident,
+            s->prefill_probation_admissions,
+            s->prefill_single_use_bypasses,
+            s->decode_reserve_admissions,
+            s->protected_victim_skips,
+            s->prompt_protected_hits,
+            s->session_protected_hits,
+            s->last_prefill_probation_admissions,
+            s->last_prefill_single_use_bypasses,
+            s->last_decode_reserve_admissions,
+            s->last_protected_victim_skips,
+            s->pinned_policy_enabled ? "true" : "false",
+            s->pinned_profile_experts,
+            s->pinned_resident_experts,
+            s->pinned_hits,
+            s->pinned_admissions,
+            s->pinned_victim_skips,
+            s->last_pinned_hits,
+            s->last_pinned_admissions,
+            s->last_pinned_victim_skips);
+    for (uint32_t i = 0; i < s->persistent_layer_ids_count; i++) {
+        fprintf(fp,
+                "%s{\"expert_id\":%d,\"slot\":%d,\"pinned\":%s}",
+                i ? "," : "",
+                s->persistent_layer_ids[i],
+                s->persistent_layer_slots[i],
+                s->persistent_layer_pinned[i] ? "true" : "false");
+    }
+    fputs("]},\"compact_experts\":[", fp);
+    for (uint32_t i = 0; i < s->compact_ids_count; i++) {
+        fprintf(fp, "%s%d", i ? "," : "", s->compact_ids[i]);
+    }
+    fputs("]}", fp);
+}
+
+static void ds4_expert_trace_write_route(
+        ds4_gpu_graph *g,
+        const char *phase,
+        uint32_t layer,
+        uint32_t position_start,
+        uint32_t token_count,
+        const int32_t *selected_ids,
+        const float *weights,
+        bool weights_valid,
+        const ds4_gpu_stream_expert_cache_snapshot *before,
+        const ds4_gpu_stream_expert_cache_snapshot *after,
+        int load_status,
+        double sync_ms,
+        double read_ms,
+        double load_ms,
+        double resume_ms) {
+    if (!g || !selected_ids || token_count == 0) return;
+    pthread_mutex_lock(&g_expert_trace.mutex);
+    FILE *fp = ds4_expert_trace_open_locked();
+    if (!fp) {
+        pthread_mutex_unlock(&g_expert_trace.mutex);
+        return;
+    }
+    fprintf(fp,
+            "{\"event\":\"expert_route\",\"schema\":1,"
+            "\"sequence\":%" PRIu64 ",\"session_id\":%" PRIu64
+            ",\"prompt_id\":%" PRIu64 ",\"phase\":\"%s\","
+            "\"layer\":%u,\"position_start\":%u,\"token_count\":%u,"
+            "\"experts_per_token\":%u,\"weights_valid\":%s,"
+            "\"cache_transaction_observed\":%s,\"load_ok\":",
+            ++g_expert_trace.next_sequence,
+            g->expert_trace_session_id,
+            g->expert_trace_prompt_id,
+            phase,
+            layer,
+            position_start,
+            token_count,
+            (unsigned)DS4_N_EXPERT_USED,
+            weights_valid ? "true" : "false",
+            load_status >= 0 ? "true" : "false");
+    if (load_status < 0) fputs("null", fp);
+    else fputs(load_status ? "true" : "false", fp);
+    fprintf(fp,
+            ",\"timing_ms\":{\"gpu_sync\":%.6f,\"readback\":%.6f,"
+            "\"cache_load\":%.6f,\"resume\":%.6f},\"routes\":[",
+            sync_ms,
+            read_ms,
+            load_ms,
+            resume_ms);
+    for (uint32_t t = 0; t < token_count; t++) {
+        fprintf(fp,
+                "%s{\"position\":%u,\"selected\":[",
+                t ? "," : "",
+                position_start + t);
+        for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) {
+            const uint64_t i = (uint64_t)t * DS4_N_EXPERT_USED + k;
+            const int32_t expert = selected_ids[i];
+            bool persistent_hit = false;
+            const int persistent_slot =
+                ds4_expert_trace_persistent_request_slot(
+                    after, layer, expert, &persistent_hit);
+            const int before_slot = persistent_hit ? persistent_slot : -1;
+            const int after_slot =
+                ds4_expert_trace_cache_slot(after, layer, expert);
+            fprintf(fp,
+                    "%s{\"rank\":%u,\"expert_id\":%d,\"weight\":",
+                    k ? "," : "",
+                    k,
+                    expert);
+            if (weights_valid) fprintf(fp, "%.9g", weights[i]);
+            else fputs("null", fp);
+            fprintf(fp,
+                    ",\"cache_before\":%s,\"cache_before_slot\":%d,"
+                    "\"cache_after\":%s,\"cache_after_slot\":%d}",
+                    before_slot >= 0 ? "true" : "false",
+                    before_slot,
+                    after_slot >= 0 ? "true" : "false",
+                    after_slot);
+        }
+        fputs("]}", fp);
+    }
+    fputs("],\"cache_before\":", fp);
+    ds4_expert_trace_write_cache_snapshot(fp, before);
+    fputs(",\"cache_after\":", fp);
+    ds4_expert_trace_write_cache_snapshot(fp, after);
+    fputs("}\n", fp);
+    fflush(fp);
+    g->expert_trace_pending_decode = false;
+    g->expert_trace_last_valid = true;
+    g->expert_trace_last_prompt_id = g->expert_trace_prompt_id;
+    g->expert_trace_last_layer = layer;
+    g->expert_trace_last_position = position_start;
+    g->expert_trace_last_tokens = token_count;
+    pthread_mutex_unlock(&g_expert_trace.mutex);
+}
+#endif
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
  * decode. The batched server serializes every operation that uses them, so one
@@ -18359,11 +18701,91 @@ static bool metal_graph_selected_profile_layer_impl(
     return true;
 }
 
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+static void metal_graph_expert_trace_prefill_layer(
+        ds4_gpu_graph           *g,
+        uint32_t                 il,
+        uint32_t                 pos0,
+        uint32_t                 n_tokens) {
+    if (!g || !ds4_expert_trace_enabled() || n_tokens == 0 ||
+        !metal_graph_batch_router_selected(g) ||
+        !metal_graph_batch_router_weights(g) ||
+        DS4_N_EXPERT_USED == 0 ||
+        DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
+        return;
+    }
+    if (g->expert_trace_last_valid &&
+        g->expert_trace_last_prompt_id == g->expert_trace_prompt_id &&
+        g->expert_trace_last_layer == il &&
+        g->expert_trace_last_position == pos0 &&
+        g->expert_trace_last_tokens == n_tokens) {
+        return;
+    }
+    if ((uint64_t)n_tokens > UINT64_MAX / DS4_N_EXPERT_USED) return;
+    const uint64_t n_ids = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+    if (n_ids > SIZE_MAX / sizeof(int32_t) ||
+        n_ids > SIZE_MAX / sizeof(float)) {
+        return;
+    }
+    int32_t *selected = xmalloc((size_t)n_ids * sizeof(selected[0]));
+    float *weights = xmalloc((size_t)n_ids * sizeof(weights[0]));
+    const bool selected_ok =
+        ds4_gpu_tensor_read(metal_graph_batch_router_selected(g),
+                            0,
+                            selected,
+                            n_ids * sizeof(selected[0])) != 0;
+    const bool weights_ok = selected_ok &&
+        ds4_gpu_tensor_read(metal_graph_batch_router_weights(g),
+                            0,
+                            weights,
+                            n_ids * sizeof(weights[0])) != 0;
+    if (selected_ok) {
+        ds4_gpu_stream_expert_cache_snapshot cache_before = {0};
+        ds4_gpu_stream_expert_cache_snapshot cache_after = {0};
+        if (g->expert_trace_prefill_cache_before_valid &&
+            g->expert_trace_prefill_layer == il &&
+            g->expert_trace_prefill_position == pos0 &&
+            g->expert_trace_prefill_tokens == n_tokens) {
+            cache_before = g->expert_trace_prefill_cache_before;
+        }
+        (void)ds4_gpu_stream_expert_cache_get_snapshot(&cache_after);
+        ds4_expert_trace_write_route(g,
+                                     "prefill",
+                                     il,
+                                     pos0,
+                                     n_tokens,
+                                     selected,
+                                     weights,
+                                     weights_ok,
+                                     &cache_before,
+                                     &cache_after,
+                                     -1,
+                                     0.0,
+                                     0.0,
+                                     0.0,
+                                     0.0);
+    } else {
+        fprintf(stderr,
+                "ds4: failed to read CUDA router ids for expert trace "
+                "at prefill layer %u\n",
+                il);
+    }
+    free(weights);
+    free(selected);
+}
+#endif
+
 static bool metal_graph_stream_prefill_selected_profile_layer(
         ds4_gpu_graph          *g,
         const ds4_layer_weights *layer,
         uint32_t                il,
+        uint32_t                pos0,
         uint32_t                n_tokens) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    metal_graph_expert_trace_prefill_layer(g, il, pos0, n_tokens);
+#else
+    (void)pos0;
+#endif
     if (!metal_graph_stream_prefill_selected_profile_enabled(g)) return true;
     return metal_graph_selected_profile_layer_impl(
             g,
@@ -20258,8 +20680,10 @@ static bool metal_graph_use_q4_selected_shared_overlap(
 
 static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const char *trace_path = getenv("DS4_EXPERT_TRACE");
     return g &&
            g->ssd_streaming &&
+           (!trace_path || !trace_path[0]) &&
            getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL;
 #else
     (void)g;
@@ -21100,10 +21524,13 @@ static bool metal_graph_decode_cuda_selected_load(
         const ds4_model          *model,
         const ds4_layer_weights  *layer,
         uint32_t                  il,
+        uint32_t                  pos,
         uint64_t                  gate_expert_bytes,
         uint64_t                  down_expert_bytes) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
-    if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
+    const bool selected_slots_expected =
+        metal_graph_decode_cuda_selected_slots_expected(g, layer);
+    if (!selected_slots_expected ||
         !model ||
         !metal_graph_router_selected(g) ||
         DS4_N_EXPERT == 0 ||
@@ -21113,20 +21540,35 @@ static bool metal_graph_decode_cuda_selected_load(
         return false;
     }
 
+    const bool trace = ds4_expert_trace_enabled();
     const bool profile =
         getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE") != NULL;
-    const double t0 = profile ? now_sec() : 0.0;
+    const bool measure = profile || trace;
+    const double t0 = measure ? now_sec() : 0.0;
+    ds4_gpu_stream_expert_cache_snapshot cache_before = {0};
+    ds4_gpu_stream_expert_cache_snapshot cache_after = {0};
 
     if (ds4_gpu_end_commands() == 0) return false;
-    const double t_sync = profile ? now_sec() : 0.0;
+    const double t_sync = measure ? now_sec() : 0.0;
 
     int32_t selected_ids[DS4_MAX_EXPERT_USED] = {0};
+    float selected_weights[DS4_MAX_EXPERT_USED] = {0};
     bool ok = ds4_gpu_tensor_read(metal_graph_router_selected(g),
                                   0,
                                   selected_ids,
                                   (uint64_t)DS4_N_EXPERT_USED *
                                       sizeof(selected_ids[0])) != 0;
-    const double t_read = profile ? now_sec() : 0.0;
+    const bool selected_ids_valid = ok;
+    bool weights_valid = false;
+    if (trace && ok && metal_graph_router_weights(g)) {
+        weights_valid =
+            ds4_gpu_tensor_read(metal_graph_router_weights(g),
+                                0,
+                                selected_weights,
+                                (uint64_t)DS4_N_EXPERT_USED *
+                                    sizeof(selected_weights[0])) != 0;
+    }
+    const double t_read = measure ? now_sec() : 0.0;
 
     if (ok) {
         const ds4_gpu_stream_expert_table table =
@@ -21135,15 +21577,40 @@ static bool metal_graph_decode_cuda_selected_load(
                                            il,
                                            gate_expert_bytes,
                                            down_expert_bytes);
+        if (trace) {
+            (void)ds4_gpu_stream_expert_cache_get_snapshot(&cache_before);
+        }
         ok = ds4_gpu_stream_expert_cache_begin_selected_load(
                     &table,
                     selected_ids,
                     DS4_N_EXPERT_USED) != 0;
+        if (trace) {
+            (void)ds4_gpu_stream_expert_cache_get_snapshot(&cache_after);
+        }
     }
-    const double t_load = profile ? now_sec() : 0.0;
+    const bool cache_load_ok = ok;
+    const double t_load = measure ? now_sec() : 0.0;
 
     if (ds4_gpu_begin_commands() == 0) ok = false;
-    const double t_done = profile ? now_sec() : 0.0;
+    const double t_done = measure ? now_sec() : 0.0;
+
+    if (trace && selected_ids_valid) {
+        ds4_expert_trace_write_route(g,
+                                     "decode",
+                                     il,
+                                     pos,
+                                     1,
+                                     selected_ids,
+                                     selected_weights,
+                                     weights_valid,
+                                     &cache_before,
+                                     &cache_after,
+                                     cache_load_ok,
+                                     (t_sync - t0) * 1000.0,
+                                     (t_read - t_sync) * 1000.0,
+                                     (t_load - t_read) * 1000.0,
+                                     (t_done - t_load) * 1000.0);
+    }
 
     if (profile) {
         fprintf(stderr,
@@ -21161,6 +21628,7 @@ static bool metal_graph_decode_cuda_selected_load(
     (void)model;
     (void)layer;
     (void)il;
+    (void)pos;
     (void)gate_expert_bytes;
     (void)down_expert_bytes;
     return false;
@@ -21172,11 +21640,14 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
         const ds4_model          *model,
         const ds4_layer_weights  *layer,
         uint32_t                  il,
+        uint32_t                  pos0,
         uint32_t                  n_tokens,
         uint64_t                  gate_expert_bytes,
         uint64_t                  down_expert_bytes) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
-    if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
+    const bool selected_slots_expected =
+        metal_graph_decode_cuda_selected_slots_expected(g, layer);
+    if (!selected_slots_expected ||
         !model ||
         !metal_graph_batch_router_selected(g) ||
         n_tokens <= 1 ||
@@ -21196,19 +21667,34 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
         return false;
     }
 
+    const bool trace = ds4_expert_trace_enabled();
     const bool profile =
         getenv("DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_PROFILE") != NULL;
-    const double t0 = profile ? now_sec() : 0.0;
+    const bool measure = profile || trace;
+    const double t0 = measure ? now_sec() : 0.0;
+    ds4_gpu_stream_expert_cache_snapshot cache_before = {0};
+    ds4_gpu_stream_expert_cache_snapshot cache_after = {0};
 
     if (ds4_gpu_end_commands() == 0) return false;
-    const double t_sync = profile ? now_sec() : 0.0;
+    const double t_sync = measure ? now_sec() : 0.0;
 
     int32_t *selected_ids = xmalloc((size_t)n_ids64 * sizeof(selected_ids[0]));
+    float *selected_weights = trace ?
+        xmalloc((size_t)n_ids64 * sizeof(selected_weights[0])) : NULL;
     bool ok = ds4_gpu_tensor_read(metal_graph_batch_router_selected(g),
                                   0,
                                   selected_ids,
                                   n_ids64 * sizeof(selected_ids[0])) != 0;
-    const double t_read = profile ? now_sec() : 0.0;
+    const bool selected_ids_valid = ok;
+    bool weights_valid = false;
+    if (trace && ok && metal_graph_batch_router_weights(g)) {
+        weights_valid =
+            ds4_gpu_tensor_read(metal_graph_batch_router_weights(g),
+                                0,
+                                selected_weights,
+                                n_ids64 * sizeof(selected_weights[0])) != 0;
+    }
+    const double t_read = measure ? now_sec() : 0.0;
     if (ok) {
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
@@ -21216,17 +21702,43 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
                                            il,
                                            gate_expert_bytes,
                                            down_expert_bytes);
+        if (trace) {
+            (void)ds4_gpu_stream_expert_cache_get_snapshot(&cache_before);
+        }
         ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
                     &table,
                     selected_ids,
                     n_tokens,
                     DS4_N_EXPERT_USED) != 0;
+        if (trace) {
+            (void)ds4_gpu_stream_expert_cache_get_snapshot(&cache_after);
+        }
     }
-    free(selected_ids);
-    const double t_load = profile ? now_sec() : 0.0;
+    const bool cache_load_ok = ok;
+    const double t_load = measure ? now_sec() : 0.0;
 
     if (ds4_gpu_begin_commands() == 0) ok = false;
-    const double t_done = profile ? now_sec() : 0.0;
+    const double t_done = measure ? now_sec() : 0.0;
+
+    if (trace && selected_ids_valid) {
+        ds4_expert_trace_write_route(g,
+                                     "prefill",
+                                     il,
+                                     pos0,
+                                     n_tokens,
+                                     selected_ids,
+                                     selected_weights,
+                                     weights_valid,
+                                     &cache_before,
+                                     &cache_after,
+                                     cache_load_ok,
+                                     (t_sync - t0) * 1000.0,
+                                     (t_read - t_sync) * 1000.0,
+                                     (t_load - t_read) * 1000.0,
+                                     (t_done - t_load) * 1000.0);
+    }
+    free(selected_weights);
+    free(selected_ids);
 
     if (profile) {
         fprintf(stderr,
@@ -21245,6 +21757,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
     (void)model;
     (void)layer;
     (void)il;
+    (void)pos0;
     (void)n_tokens;
     (void)gate_expert_bytes;
     (void)down_expert_bytes;
@@ -21265,6 +21778,8 @@ typedef struct metal_graph_selected_async_load {
     uint64_t                  event_value;
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
+    uint32_t                  n_tokens;
+    int32_t                  *batch_selected_ids;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
 } metal_graph_selected_async_load;
 
@@ -21286,17 +21801,21 @@ static void metal_graph_selected_async_load_run(
 
     if (!job->router_selected || !job->model || !job->layer ||
         DS4_N_EXPERT == 0 || DS4_N_EXPERT > DS4_MAX_EXPERT ||
-        DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
+        DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED ||
+        (job->n_tokens > 0 && !job->batch_selected_ids)) {
         return;
     }
+    const uint64_t n_selected = job->n_tokens > 0 ?
+        (uint64_t)job->n_tokens * DS4_N_EXPERT_USED : DS4_N_EXPERT_USED;
+    int32_t *selected_ids = job->n_tokens > 0 ?
+        job->batch_selected_ids : job->selected_ids;
     if (job->event_value != 0) {
 #ifdef DS4_ROCM_BUILD
         if (ds4_gpu_tensor_read_after_selected_event(
                     job->router_selected,
                     0,
-                    job->selected_ids,
-                    (uint64_t)DS4_N_EXPERT_USED *
-                        sizeof(job->selected_ids[0]),
+                    selected_ids,
+                    n_selected * sizeof(selected_ids[0]),
                     job->event_value,
                     "selected-id async expert load") == 0) {
             return;
@@ -21308,19 +21827,18 @@ static void metal_graph_selected_async_load_run(
         }
         if (ds4_gpu_tensor_read(job->router_selected,
                                 0,
-                                job->selected_ids,
-                                (uint64_t)DS4_N_EXPERT_USED *
-                                    sizeof(job->selected_ids[0])) == 0) {
+                                selected_ids,
+                                n_selected * sizeof(selected_ids[0])) == 0) {
             return;
         }
 #endif
     }
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        if (job->selected_ids[i] < 0 ||
-            (uint32_t)job->selected_ids[i] >= DS4_N_EXPERT) {
+    for (uint64_t i = 0; i < n_selected; i++) {
+        if (selected_ids[i] < 0 ||
+            (uint32_t)selected_ids[i] >= DS4_N_EXPERT) {
             fprintf(stderr,
-                    "ds4: Metal streaming async selected expert id %d is outside 0..%u at layer %u\n",
-                    job->selected_ids[i],
+                    "ds4: streaming async selected expert id %d is outside 0..%u at layer %u\n",
+                    selected_ids[i],
                     DS4_N_EXPERT,
                     job->il);
             return;
@@ -21333,10 +21851,12 @@ static void metal_graph_selected_async_load_run(
                                        job->il,
                                        job->gate_expert_bytes,
                                        job->down_expert_bytes);
-    if (ds4_gpu_stream_expert_cache_begin_selected_load(
-                &table,
-                job->selected_ids,
-                DS4_N_EXPERT_USED) == 0) {
+    const bool loaded = job->n_tokens > 0 ?
+        ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                &table, selected_ids, job->n_tokens, DS4_N_EXPERT_USED) != 0 :
+        ds4_gpu_stream_expert_cache_begin_selected_load(
+                &table, selected_ids, DS4_N_EXPERT_USED) != 0;
+    if (!loaded) {
         return;
     }
 
@@ -21450,6 +21970,53 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
             down_expert_bytes);
 }
 
+static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_batch(
+        metal_graph_selected_async_load *job,
+        ds4_gpu_tensor                  *router_selected,
+        const ds4_model                 *model,
+        const ds4_layer_weights         *layer,
+        uint32_t                         il,
+        uint32_t                         n_tokens,
+        uint64_t                         event_value,
+        uint64_t                         gate_expert_bytes,
+        uint64_t                         down_expert_bytes) {
+    if (!job || !router_selected || !model || !layer || n_tokens <= 1 ||
+        event_value == 0 || DS4_N_EXPERT_USED == 0 ||
+        (uint64_t)n_tokens > SIZE_MAX /
+            ((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t))) {
+        return false;
+    }
+    if (!metal_graph_selected_async_load_ensure_worker()) return false;
+
+    memset(job, 0, sizeof(*job));
+    const size_t bytes = (size_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int32_t);
+    job->batch_selected_ids = xmalloc(bytes);
+    job->router_selected = router_selected;
+    job->model = model;
+    job->layer = layer;
+    job->il = il;
+    job->n_tokens = n_tokens;
+    job->event_value = event_value;
+    job->gate_expert_bytes = gate_expert_bytes;
+    job->down_expert_bytes = down_expert_bytes;
+
+    pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
+    if (g_metal_graph_selected_async_load_has_job ||
+        g_metal_graph_selected_async_load_done) {
+        pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
+        free(job->batch_selected_ids);
+        job->batch_selected_ids = NULL;
+        return false;
+    }
+    g_metal_graph_selected_async_load_job = *job;
+    g_metal_graph_selected_async_load_job.ok = false;
+    g_metal_graph_selected_async_load_has_job = true;
+    pthread_cond_signal(&g_metal_graph_selected_async_load_cond);
+    pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
+    job->active = true;
+    return true;
+}
+
 static bool metal_graph_selected_async_load_finish(
         metal_graph_selected_async_load *job) {
     if (!job || !job->active) return false;
@@ -21462,9 +22029,11 @@ static bool metal_graph_selected_async_load_finish(
     g_metal_graph_selected_async_load_done = false;
     pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
     job->active = false;
-    if (!job->ok) return false;
-    return ds4_gpu_routed_moe_set_selected_override(job->selected_ids,
-                                                   DS4_N_EXPERT_USED) != 0;
+    const bool ok = job->ok &&
+        (job->n_tokens > 0 ||
+         ds4_gpu_routed_moe_set_selected_override(job->selected_ids,
+                                                  DS4_N_EXPERT_USED) != 0);
+    return ok;
 }
 
 #ifdef DS4_ROCM_BUILD
@@ -21663,8 +22232,20 @@ static bool metal_graph_profile_router_selection(
         const ds4_layer_weights  *layer,
         uint32_t                  il,
         uint32_t                  pos) {
-    if (!g_expert_profile.active) return true;
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const bool expert_trace = ds4_expert_trace_enabled();
+#else
+    const bool expert_trace = false;
+#endif
+    if (!g_expert_profile.active && !expert_trace) return true;
     if (!g || !layer || !metal_graph_router_selected(g) || !metal_graph_router_weights(g)) return false;
+
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (expert_trace) {
+        (void)ds4_gpu_stream_expert_cache_get_snapshot(
+                &g->expert_trace_pending_cache_before);
+    }
+#endif
 
     if (ds4_gpu_end_commands() == 0) {
         fprintf(stderr,
@@ -21694,11 +22275,26 @@ static bool metal_graph_profile_router_selection(
         return false;
     }
 
-    ds4_expert_profile_record(il,
-                              pos,
-                              selected,
-                              weights,
-                              layer->ffn_gate_tid2eid != NULL);
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (expert_trace) {
+        memcpy(g->expert_trace_pending_selected,
+               selected,
+               (size_t)DS4_N_EXPERT_USED * sizeof(selected[0]));
+        memcpy(g->expert_trace_pending_weights,
+               weights,
+               (size_t)DS4_N_EXPERT_USED * sizeof(weights[0]));
+        g->expert_trace_pending_layer = il;
+        g->expert_trace_pending_position = pos;
+        g->expert_trace_pending_decode = true;
+    }
+#endif
+    if (g_expert_profile.active) {
+        ds4_expert_profile_record(il,
+                                  pos,
+                                  selected,
+                                  weights,
+                                  layer->ffn_gate_tid2eid != NULL);
+    }
     return true;
 }
 
@@ -23733,6 +24329,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                    model,
                                                    layer,
                                                    il,
+                                                   pos,
                                                    gate_expert_bytes,
                                                    down_expert_bytes);
     }
@@ -24429,9 +25026,35 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
-    return metal_graph_encode_decode_layer_phase(
+    const bool ok = metal_graph_encode_decode_layer_phase(
             g, model, layer, il, pos, raw_cache, raw_cap, raw_row, n_raw,
             token, METAL_DECODE_LAYER_FULL);
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (g &&
+        g->expert_trace_pending_decode &&
+        g->expert_trace_pending_layer == il &&
+        g->expert_trace_pending_position == pos) {
+        ds4_gpu_stream_expert_cache_snapshot cache_after = {0};
+        (void)ds4_gpu_stream_expert_cache_get_snapshot(&cache_after);
+        ds4_expert_trace_write_route(
+                g,
+                "decode",
+                il,
+                pos,
+                1,
+                g->expert_trace_pending_selected,
+                g->expert_trace_pending_weights,
+                true,
+                &g->expert_trace_pending_cache_before,
+                &cache_after,
+                -1,
+                0.0,
+                0.0,
+                0.0,
+                0.0);
+    }
+#endif
+    return ok;
 }
 
 static bool metal_graph_output_logits_head_matmul(
@@ -29133,11 +29756,61 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
-    if (ok) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (ok && ds4_expert_trace_enabled()) {
+        g->expert_trace_prefill_cache_before_valid =
+            ds4_gpu_stream_expert_cache_get_snapshot(
+                    &g->expert_trace_prefill_cache_before) != 0;
+        g->expert_trace_prefill_layer = il;
+        g->expert_trace_prefill_position = pos0;
+        g->expert_trace_prefill_tokens = n_tokens;
+    }
+#endif
+
+    metal_graph_selected_async_load cuda_prefill_selected_async = {0};
+    bool cuda_prefill_selected_async_started = false;
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const bool cuda_prefill_selected_shared_overlap =
+        ok &&
+        metal_graph_tp_env_flag(
+                "DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP", false) &&
+        !ds4_expert_trace_enabled() &&
+        metal_graph_decode_cuda_selected_slots_expected(g, layer) &&
+        model &&
+        metal_graph_batch_router_selected(g) &&
+        n_tokens > 1 &&
+        DS4_N_EXPERT > 0 &&
+        DS4_N_EXPERT_USED > 0 &&
+        getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_LOAD") == NULL;
+    if (cuda_prefill_selected_shared_overlap) {
+        uint64_t selected_event = 0;
+        if (ds4_gpu_signal_selected_readback_ready(&selected_event) != 0) {
+            cuda_prefill_selected_async_started =
+                metal_graph_selected_async_load_start_batch(
+                        &cuda_prefill_selected_async,
+                        metal_graph_batch_router_selected(g),
+                        model,
+                        layer,
+                        il,
+                        n_tokens,
+                        selected_event,
+                        gate_expert_bytes,
+                        down_expert_bytes);
+            if (!cuda_prefill_selected_async_started) {
+                (void)ds4_gpu_commit_and_wait_selected_readback(
+                        selected_event,
+                        "prefill selected-id async fallback");
+            }
+        }
+    }
+#endif
+
+    if (ok && !cuda_prefill_selected_async_started) {
         ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
                                                                  model,
                                                                  layer,
                                                                  il,
+                                                                 pos0,
                                                                  n_tokens,
                                                                  gate_expert_bytes,
                                                                  down_expert_bytes);
@@ -29178,11 +29851,13 @@ static bool metal_graph_encode_layer_ffn_batch(
 
     const bool selected_readahead_shared =
         metal_graph_stream_prefill_selected_readahead_shared_enabled(g)
+        && !cuda_prefill_selected_async_started
 #ifdef DS4_ROCM_BUILD
         && !rocm_batch_selected_async_started
 #endif
         ;
     if (ok &&
+        !cuda_prefill_selected_async_started &&
         metal_graph_stream_prefill_selected_readahead_enabled(g) &&
 #ifdef DS4_ROCM_BUILD
         !rocm_batch_selected_async_started &&
@@ -29283,6 +29958,33 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_tensor_row_range_view(metal_graph_batch_ffn_norm(g), tp_row0, tp_rows,
                                           DS4_N_EMBD) : NULL;
     if (tp_row_split_ffn && !tp_ffn_x) ok = false;
+    if (cuda_prefill_selected_async_started) {
+        if (ok) {
+            DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
+            shared_done = ok;
+        }
+        const bool flush_ok = ds4_gpu_flush_commands() != 0;
+        bool finish_ok =
+            metal_graph_selected_async_load_finish(
+                    &cuda_prefill_selected_async);
+        if (!finish_ok && cuda_prefill_selected_async.ids_ok &&
+            cuda_prefill_selected_async.batch_selected_ids) {
+            const ds4_gpu_stream_expert_table retry_table =
+                graph_stream_expert_table_make(model,
+                                               layer,
+                                               il,
+                                               gate_expert_bytes,
+                                               down_expert_bytes);
+            finish_ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                    &retry_table,
+                    cuda_prefill_selected_async.batch_selected_ids,
+                    n_tokens,
+                    DS4_N_EXPERT_USED) != 0;
+        }
+        free(cuda_prefill_selected_async.batch_selected_ids);
+        cuda_prefill_selected_async.batch_selected_ids = NULL;
+        ok = ok && flush_ok && finish_ok;
+    }
     if (ok && selected_readahead_shared) {
         if (ds4_gpu_end_commands() == 0) {
             ok = false;
@@ -29311,6 +30013,7 @@ static bool metal_graph_encode_layer_ffn_batch(
 
     if (ok &&
         !shared_done &&
+        !cuda_prefill_selected_async_started &&
         (metal_graph_stream_prefill_selected_pagein_enabled(g) ||
          metal_graph_stream_prefill_selected_madvise_enabled(g))) {
         metal_graph_stream_pagein_job pagein_job;
@@ -33956,6 +34659,7 @@ static bool metal_graph_prefill_layer_major(
                         g,
                         &weights->layer[il],
                         il,
+                        start,
                         n_tokens);
             }
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
@@ -34015,6 +34719,7 @@ static bool metal_graph_prefill_layer_major(
                         g,
                         &weights->layer[il],
                         il,
+                        start,
                         n_tokens);
             }
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
@@ -40767,6 +41472,7 @@ static bool glm_graph_encode_sparse_ffn_one(
             .model_map = model->map,
             .model_size = model->size,
             .layer = il,
+            .n_layer = DS4_N_LAYER,
             .n_total_expert = DS4_N_EXPERT,
             .gate_offset = l->ffn_gate_exps->abs_offset,
             .up_offset = l->ffn_up_exps->abs_offset,
@@ -43017,6 +43723,7 @@ static bool glm_graph_mtp_step(
                 .model_map = model->map,
                 .model_size = model->size,
                 .layer = il,
+                .n_layer = DS4_N_LAYER,
                 .n_total_expert = DS4_N_EXPERT,
                 .gate_offset = l->ffn_gate_exps->abs_offset,
                 .up_offset = l->ffn_up_exps->abs_offset,
@@ -47010,6 +47717,7 @@ static int glm_metal_first_token_logits(
                     .model_map = model->map,
                     .model_size = model->size,
                     .layer = il,
+                    .n_layer = DS4_N_LAYER,
                     .n_total_expert = DS4_N_EXPERT,
                     .gate_offset = gl->ffn_gate_exps->abs_offset,
                     .up_offset = gl->ffn_up_exps->abs_offset,
@@ -47461,6 +48169,9 @@ static int generate_metal_graph_raw_swa(
     const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
+#if !defined(DS4_ROCM_BUILD) && !defined(__APPLE__)
+    if (ssd_streaming) ds4_gpu_stream_expert_cache_prompt_begin();
+#endif
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
         ok = metal_graph_prefill_chunked(&g, model, weights, prompt,
@@ -47478,13 +48189,22 @@ static int generate_metal_graph_raw_swa(
     if (memory_report) ds4_gpu_print_memory_report("after prefill");
 
     if (!ok) {
+#if !defined(DS4_ROCM_BUILD) && !defined(__APPLE__)
+        if (ssd_streaming) ds4_gpu_stream_expert_cache_prompt_end();
+#endif
         free(logits);
         metal_graph_free(&g);
         return 1;
     }
+#if !defined(DS4_ROCM_BUILD) && !defined(__APPLE__)
+    if (ssd_streaming) ds4_gpu_stream_expert_cache_prefill_end();
+#endif
     const char *dump_prefill_logits = getenv("DS4_METAL_DUMP_PREFILL_LOGITS");
     if (dump_prefill_logits && dump_prefill_logits[0]) {
         if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
+#if !defined(DS4_ROCM_BUILD) && !defined(__APPLE__)
+            if (ssd_streaming) ds4_gpu_stream_expert_cache_prompt_end();
+#endif
             free(logits);
             metal_graph_free(&g);
             return 1;
@@ -47541,6 +48261,9 @@ static int generate_metal_graph_raw_swa(
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
 
     if (memory_report) ds4_gpu_print_memory_report("before graph free");
+#if !defined(DS4_ROCM_BUILD) && !defined(__APPLE__)
+    if (ssd_streaming) ds4_gpu_stream_expert_cache_prompt_end();
+#endif
     free(logits);
     metal_graph_free(&g);
     return ok ? 0 : 1;
@@ -48232,6 +48955,8 @@ struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
+    uint64_t expert_trace_session_id;
+    uint64_t expert_trace_prompt_id;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
@@ -48296,6 +49021,106 @@ struct ds4_session {
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
+
+#ifndef DS4_NO_GPU
+static void ds4_expert_trace_begin_prompt(
+        ds4_session *s, const ds4_tokens *prompt) {
+    if (!s || !s->engine || !prompt || prompt->len <= 0) return;
+    pthread_mutex_lock(&g_expert_trace.mutex);
+    FILE *fp = ds4_expert_trace_open_locked();
+    if (!fp) {
+        pthread_mutex_unlock(&g_expert_trace.mutex);
+        return;
+    }
+    if (s->expert_trace_session_id == 0) {
+        s->expert_trace_session_id = ++g_expert_trace.next_session_id;
+        if (s->expert_trace_session_id == 0) {
+            s->expert_trace_session_id = ++g_expert_trace.next_session_id;
+        }
+    }
+    s->expert_trace_prompt_id++;
+    /* The release graph is embedded even for CPU/GLM sessions; assigning the
+     * trace context is harmless there and avoids backend-dependent setup. */
+    s->graph.expert_trace_session_id = s->expert_trace_session_id;
+    s->graph.expert_trace_prompt_id = s->expert_trace_prompt_id;
+    fprintf(fp,
+            "{\"event\":\"prompt\",\"schema\":1,"
+            "\"sequence\":%" PRIu64 ",\"session_id\":%" PRIu64
+            ",\"prompt_id\":%" PRIu64 ",\"prompt_form\":"
+            "\"rendered_model_input\",\"token_count\":%d,\"tokens\":[",
+            ++g_expert_trace.next_sequence,
+            s->expert_trace_session_id,
+            s->expert_trace_prompt_id,
+            prompt->len);
+    for (int i = 0; i < prompt->len; i++) {
+        fprintf(fp, "%s%d", i ? "," : "", prompt->v[i]);
+    }
+    fputs("],\"text\":", fp);
+    fputc('"', fp);
+    for (int i = 0; i < prompt->len; i++) {
+        size_t len = 0;
+        char *piece = ds4_token_text(s->engine, prompt->v[i], &len);
+        if (!piece) continue;
+        /* Write the escaped bytes without adding a quote around each token. */
+        for (size_t j = 0; j < len; j++) {
+            const unsigned char c = (unsigned char)piece[j];
+            switch (c) {
+            case '"': fputs("\\\"", fp); break;
+            case '\\': fputs("\\\\", fp); break;
+            case '\b': fputs("\\b", fp); break;
+            case '\f': fputs("\\f", fp); break;
+            case '\n': fputs("\\n", fp); break;
+            case '\r': fputs("\\r", fp); break;
+            case '\t': fputs("\\t", fp); break;
+            default:
+                if (c < 0x20) fprintf(fp, "\\u%04x", (unsigned)c);
+                else fputc((int)c, fp);
+                break;
+            }
+        }
+        free(piece);
+    }
+    fputs("\"}\n", fp);
+    fflush(fp);
+    pthread_mutex_unlock(&g_expert_trace.mutex);
+}
+#else
+static void ds4_expert_trace_begin_prompt(
+        ds4_session *s, const ds4_tokens *prompt) {
+    (void)s;
+    (void)prompt;
+}
+#endif
+
+static void ds4_prompt_expert_cache_begin(ds4_engine *e) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (e && e->backend == DS4_BACKEND_CUDA && e->ssd_streaming) {
+        ds4_gpu_stream_expert_cache_prompt_begin();
+    }
+#else
+    (void)e;
+#endif
+}
+
+static void ds4_prompt_expert_cache_prefill_end(ds4_engine *e) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (e && e->backend == DS4_BACKEND_CUDA && e->ssd_streaming) {
+        ds4_gpu_stream_expert_cache_prefill_end();
+    }
+#else
+    (void)e;
+#endif
+}
+
+static void ds4_prompt_expert_cache_end(ds4_engine *e) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (e && e->backend == DS4_BACKEND_CUDA && e->ssd_streaming) {
+        ds4_gpu_stream_expert_cache_prompt_end();
+    }
+#else
+    (void)e;
+#endif
+}
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -53381,6 +54206,7 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
                 .model_map = model->map,
                 .model_size = model->size,
                 .layer = sparse_il,
+                .n_layer = DS4_N_LAYER,
                 .n_total_expert = DS4_N_EXPERT,
                 .gate_offset = sparse_layer->ffn_gate_exps->abs_offset,
                 .up_offset = sparse_layer->ffn_up_exps->abs_offset,
@@ -53685,6 +54511,7 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
                     .model_map = model->map,
                     .model_size = model->size,
                     .layer = il,
+                    .n_layer = DS4_N_LAYER,
                     .n_total_expert = DS4_N_EXPERT,
                     .gate_offset = gl->ffn_gate_exps->abs_offset,
                     .up_offset = gl->ffn_up_exps->abs_offset,
@@ -58759,8 +59586,14 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
         if (rc != 0 || !worker_ok || !logits_ok) {
             ds4_session_invalidate(s);
+            ds4_prompt_expert_cache_end(s ? s->engine : NULL);
             return rc != 0 ? rc : 1;
         }
+    }
+    if (rc == 0) {
+        ds4_prompt_expert_cache_prefill_end(s ? s->engine : NULL);
+    } else {
+        ds4_prompt_expert_cache_end(s ? s->engine : NULL);
     }
     return rc;
 }
@@ -58784,6 +59617,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
+    ds4_expert_trace_begin_prompt(s, prompt);
+    ds4_prompt_expert_cache_begin(s->engine);
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         return ds4_dist_session_sync(s->distributed,
