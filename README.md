@@ -2,6 +2,329 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+# DwarfStar RTX 5080 CUDA fork
+
+This fork of [antirez/ds4](https://github.com/antirez/ds4) is a focused,
+measured configuration for running **DeepSeek V4 Flash on an NVIDIA GeForce
+RTX 5080 with 16 GB of VRAM**, using CUDA and a fast NVMe SSD. Development and
+performance measurements were made on an **RTX 5080 Laptop GPU (Blackwell,
+`sm_120`) under Linux/WSL2**. A desktop RTX 5080 uses the same CUDA architecture
+but may produce different timings because of its higher power limit, cooling,
+CPU, memory, and storage.
+
+This is not an official upstream DwarfStar release. It intentionally favors
+the tested 5080 SSD-streaming configuration over broad hardware portability.
+The original project remains the authoritative source for other GPUs, Metal,
+ROCm, distributed inference, model creation, and general documentation.
+
+## What this fork is designed to do
+
+The DeepSeek V4 Flash GGUF used here is about 81 GB, far larger than 16 GB of
+VRAM and the measured host's RAM. The fork therefore keeps dense tensors and a
+dynamic working set of routed experts on the GPU, reads missing experts from
+NVMe, and grows the compressed KV cache only as context is consumed. The
+default profile targets a 131,072-token context without reserving all KV memory
+at startup.
+
+The measured profile is:
+
+| Setting | Fork default |
+|---|---:|
+| GPU | RTX 5080 Laptop GPU, 16 GB, `sm_120` |
+| Model | DeepSeek V4 Flash 0731 IQ2/Q2 GGUF |
+| Context | 131,072 tokens |
+| SSD expert budget | 8 GB |
+| Prefill chunk | 1,024 tokens |
+| CUDA weight-arena chunk | 256 MiB |
+| Initial physical KV capacity | 4,096 tokens, grown geometrically |
+| SSD readers | 4 persistent direct-I/O workers |
+
+## Measured performance
+
+These numbers describe this exact laptop, model, prompt set, CUDA build, and
+thermal conditions. They are not a promise for every RTX 5080 system.
+Correctness gates compared generated text, token counts, status, and finish
+reason; kernel tests used exact indices or bitwise output where appropriate.
+
+| Measurement | Baseline | Retained profile | Change |
+|---|---:|---:|---:|
+| Ten-prompt decode median | 3.427 tok/s | 3.687 tok/s | **+7.6%** |
+| 8 GB cache decode range | — | 3.725-3.752 tok/s | **+8.7% to +9.5%** vs baseline |
+| 8 GB cache short-prefill range | 5.006 tok/s median | 5.107-5.295 tok/s | **+2.0% to +5.8%** |
+| 820-token prefill, chunk 512 → 1024 | 32.908 tok/s | 49.108 tok/s | **+49.2%** |
+| Sampled peak VRAM with lazy KV | 15,775 MiB | 14,029 MiB | **-1,746 MiB** |
+| Wide-context exact top-K kernel | 0.112 ms | 0.088 ms | **1.27× faster** |
+
+All ten final benchmark answers matched the recovered baseline. A forced
+8-token KV allocation test crossed 42 growth events and also remained exact.
+
+Some implemented experiments are deliberately **off by default** because the
+measurements rejected them:
+
+- KV-prefix-aware expert reuse improved repeated-suffix prefill by 2.41%, but
+  the measured end-to-end run was 4.78% slower.
+- Single-GPU SSD union loading was about 0.8% slower for two sessions and
+  32.8% slower for four sessions. The identical-prompt strict oracle passed
+  with zero logit difference, but there was no throughput win.
+- A 512 MiB weight arena was slightly slower and failed the ten-sentence exact
+  output gate. The retained value is 256 MiB.
+- Predictive/shared-expert prefetch overlap did not improve the live run and
+  still left about 9 ms of caller wait per routed layer. It remains disabled.
+- MMQ prefill, pinned-expert profiles, and prompt-aware cache admission did not
+  produce a repeatable improvement on this workload.
+
+## Changes from the original project
+
+The fork retains upstream DwarfStar's model, tokenizer, server, agent, and CUDA
+foundation, and adds or changes the following RTX 5080 paths:
+
+- **Blackwell build and preserved binaries:** explicit `sm_120` CUDA builds,
+  checked-in measured executables, and a launcher guard that verifies both the
+  CUDA source blob and the executable SHA-256 before using the pinned profile.
+- **Lazy compressed KV allocation:** a 128K logical context starts with 4K of
+  physical compressed-KV rows per layer and grows geometrically without losing
+  live rows. CUDA graph captures are invalidated before an address changes.
+- **Larger useful expert cache:** the KV saving makes an 8 GB streaming budget
+  practical on a 16 GB GPU. Frequently used experts are dynamically promoted
+  from SSD to VRAM; colder residents are evicted using frequency/LRU evidence.
+- **Exact wide-context top-K:** single-token decode uses the faster exact
+  streaming top-K path after the compressed index grows beyond 8,192 rows.
+- **NVMe transfer pipeline:** grouped gate/up/down reads, one to four parallel
+  direct-I/O workers, persistent reader threads, reusable pinned staging
+  buffers, and small-miss parallelism.
+- **Decode-aware expert residency:** layer-local LRU behavior during decode,
+  optional prompt/session admission policy, optional per-layer capacities, and
+  optional pinned-expert profiles.
+- **KV-prefix knowledge:** exact prefix keys can retain bounded expert-routing
+  observations and bias admission for a later prefill with the same cached KV
+  prefix. It is available for experiments but is not enabled by the measured
+  launcher.
+- **Dual-SSD striping:** a byte-identical second GGUF can serve deterministic
+  4 MiB logical stripes. Size and sampled contents are validated before use,
+  and each path has independent buffered/direct file descriptors.
+- **Server batch union instrumentation:** tensor-parallel server batches report
+  unioned routed execution. An experimental single-GPU SSD path deduplicates
+  selected expert loads across sessions before executing the rows.
+- **Prefetch telemetry:** counters report load jobs, queue contention, service
+  time, caller wait, and unused prefetched slots. Predictive prefetch is kept
+  off because those counters did not justify enabling it.
+- **NUMA behavior:** on multi-node Linux hosts, only persistent SSD reader
+  workers are pinned to CPUs local to the GPU's PCI NUMA node. The whole process
+  is not bound, and single-node systems are unchanged.
+- **Automatic hardware tuner:** `tools/tune_cuda_streaming.py` explains the
+  detected GPU, VRAM, CPU, RAM, model size, and NUMA topology; its tune mode
+  changes one setting at a time and rejects output mismatches.
+- **Tracing and regression tooling:** corrected `DS4_EXPERT_TRACE` handling,
+  prompt/cache JSONL traces, ten-prompt A/B runners, analysis scripts, cache
+  policy tests, long-context tests, and CUDA session-batch checks.
+- **Operational tooling:** native WSL launchers, interactive log capture,
+  CUDA Docker files, and generated-log exclusion in `.gitignore`.
+
+## Requirements
+
+- Linux or WSL2 with a working NVIDIA driver.
+- NVIDIA RTX 5080 (`sm_120`); this is the only GPU profile measured here.
+- CUDA toolkit with `nvcc` and cuBLAS. The preserved build used CUDA 13.3.1.
+- A fast NVMe SSD with roughly 90 GB free for the model and working files.
+- The supported DeepSeek V4 Flash GGUF; arbitrary GGUF files are not supported.
+- Git, GNU Make, a C compiler, Python 3, and standard Linux build tools.
+
+## Build for RTX 5080
+
+Clone this fork and select its optimized branch:
+
+```sh
+git clone https://github.com/peppe200175/ds4.git
+cd ds4
+git switch local/ds4-cuda-definitive
+```
+
+Download the supported routed IQ2/Q2 model using the upstream helper:
+
+```sh
+./download_model.sh ds4f-q2
+```
+
+Build specifically for Blackwell `sm_120`:
+
+```sh
+make cuda CUDA_ARCH=sm_120
+```
+
+`CUDA_HOME` is auto-detected from `/usr/local/cuda` or `nvcc`. Override it if
+your toolkit is elsewhere:
+
+```sh
+make cuda CUDA_ARCH=sm_120 CUDA_HOME=/opt/cuda
+```
+
+## Run the measured profile
+
+The portable form of the measured command is:
+
+```sh
+DS4_CUDA_MMQ=0 \
+DS4_CUDA_NO_Q8_F16_CACHE=1 \
+DS4_CUDA_STREAMING_READ_THREADS=4 \
+DS4_CUDA_STREAMING_SMALL_MISS_PARALLEL=1 \
+DS4_CUDA_STREAMING_PERSISTENT_READERS=1 \
+DS4_CUDA_STREAMING_NUMA_AFFINITY=1 \
+DS4_CUDA_DECODE_CACHE_LRU=1 \
+DS4_CUDA_DYNAMIC_TIER_PROMOTION=1 \
+DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP=0 \
+DS4_CUDA_PROMPT_EXPERT_CACHE=0 \
+DS4_CUDA_PREFIX_EXPERT_CACHE=0 \
+DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=256 \
+DS4_CUDA_LAZY_KV_CACHE=1 \
+DS4_CUDA_LAZY_KV_INITIAL_TOKENS=4096 \
+./ds4 --cuda -m ./ds4flash.gguf \
+  --ssd-streaming --ssd-streaming-cache-experts 8GB \
+  --prefill-chunk 1024 --ctx 131072 --nothink
+```
+
+`run_ds4_cuda.sh` contains the same workstation profile and verifies the pinned
+source/binary identity. It currently contains the original test machine's CUDA
+and model paths, so review those paths before using it in another checkout. A
+locally rebuilt binary will also need a deliberately updated integrity hash;
+otherwise the guard correctly refuses to launch it.
+
+For the OpenAI-compatible server, use the same environment and replace the
+last command with:
+
+```sh
+./ds4-server --cuda -m ./ds4flash.gguf \
+  --ssd-streaming --ssd-streaming-cache-experts 8GB \
+  --prefill-chunk 1024 --ctx 131072 --port 8080
+```
+
+## Automatic tuning
+
+Print an explainable plan without running inference:
+
+```sh
+python3 tools/tune_cuda_streaming.py plan \
+  --model ./ds4flash.gguf --ctx 131072
+```
+
+Run the correctness-gated five-profile sweep over all ten test sentences:
+
+```sh
+python3 tools/tune_cuda_streaming.py tune \
+  --model ./ds4flash.gguf --ctx 131072 --sentences 10 \
+  --output ./ds4_cuda_tuning.json
+```
+
+The sweep tests the initial profile, arena 512, prefill chunk 512, one less GiB
+of expert cache, and two SSD readers. It writes a machine-readable report and
+selects only among candidates whose five compared output fields match the
+baseline.
+
+## New environment variables
+
+Boolean values use `1` to enable and `0` to disable unless stated otherwise.
+Variables marked **experimental** or **diagnostic** should not be added to a
+production launcher without a controlled correctness and performance A/B run.
+
+### Measured runtime controls
+
+| Variable | Default in `run_ds4_cuda.sh` | Meaning |
+|---|---:|---|
+| `DS4_CUDA_MMQ` | `0` | Enables the compact selected-expert MMQ prefill tier. Measured slower here, so disabled. |
+| `DS4_CUDA_NO_Q8_F16_CACHE` | `1` | Disables the optional Q8→F16 weight-cache conversion used by other CUDA profiles. |
+| `DS4_CUDA_WEIGHT_ARENA_CHUNK_MB` | `256` | Allocation chunk for the CUDA weight arena. The upstream-style 1792 MiB reservation was too large late in startup on 16 GB VRAM. |
+| `DS4_CUDA_LAZY_KV_CACHE` | `1` | Enables lossless geometric growth of compressed KV allocations. |
+| `DS4_CUDA_LAZY_KV_INITIAL_TOKENS` | `4096` | Initial physical token capacity used by lazy KV. Logical `--ctx` is unchanged. |
+| `DS4_CUDA_STREAMING_READ_THREADS` | `4` | Number of parallel selected-expert readers, clamped to 1-4. |
+| `DS4_CUDA_STREAMING_SMALL_MISS_PARALLEL` | `1` | Lets a small gate/up/down miss use the available reader lanes. |
+| `DS4_CUDA_STREAMING_PERSISTENT_READERS` | `1` | Keeps reader threads alive between expert loads. |
+| `DS4_CUDA_STREAMING_NUMA_AFFINITY` | `1` | On multi-node Linux, binds only SSD readers to the GPU-local NUMA CPUs. |
+| `DS4_CUDA_DECODE_CACHE_LRU` | `1` | Uses layer-local LRU victim selection during decode. |
+| `DS4_CUDA_DYNAMIC_TIER_PROMOTION` | `1` | Promotes hot SSD experts into VRAM and demotes cold residents. Set `0` for a static first-fill control. |
+| `DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP` | `0` | Overlaps selected-expert loading with shared-expert work. Correct but not faster here. |
+| `DS4_CUDA_PROMPT_EXPERT_CACHE` | `0` | Enables experimental prompt/session-aware cache admission and early-decode protection. |
+| `DS4_CUDA_PREFIX_EXPERT_CACHE` | `0` | Enables experimental routing knowledge keyed by an exact reused KV prefix. |
+
+### Storage, cache, and expert-policy controls
+
+| Variable | Meaning |
+|---|---|
+| `DS4_CUDA_MODEL_REPLICA_PATH=FILE` | Uses a byte-identical GGUF on a second physical SSD for deterministic 4 MiB read striping. Do not use two paths on one device. |
+| `DS4_CUDA_NO_DIRECT_IO=1` | Disables Linux direct I/O and uses buffered reads; diagnostic fallback. |
+| `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=N` | Caps CUDA model-weight cache allocation in GiB. |
+| `DS4_CUDA_MODEL_COPY_CHUNK_MB=N` | Overrides the model copy/staging chunk; the measured launcher deliberately unsets it. |
+| `DS4_CUDA_DECODE_CACHE_EXTRA_EXPERTS=N` | Adds experimental decode cache capacity beyond the normal budget. |
+| `DS4_CUDA_LAYER_CACHE_CAPACITIES_FILE=FILE` | Loads experimental per-layer expert-cache capacities. |
+| `DS4_CUDA_PINNED_EXPERTS_FILE=FILE` | Loads a per-layer list of experts eligible for pinning after first use. Example profiles are under `profiles/`. |
+| `DS4_CUDA_PINNED_EXPERTS_PREFILL_ONLY=1` | Applies the pinned-expert profile only during prefill. |
+| `DS4_CUDA_PROMPT_CACHE_PROMPT_PCT=N` | Percent of cache policy capacity reserved for the current prompt, clamped to 0-90. |
+| `DS4_CUDA_PROMPT_CACHE_SESSION_PCT=N` | Percent reserved for cross-prompt session history, clamped to 0-90. |
+| `DS4_CUDA_PROMPT_CACHE_MIN_PREFILL_USES=N` | Minimum observed prefill frequency for prompt-aware admission, clamped to 1-32. |
+| `DS4_CUDA_PROMPT_CACHE_PROTECT_TOKENS=N` | Decode-token lifetime of protected prompt/session residents, clamped to 1-4096. |
+
+### Tracing, telemetry, and server-batch experiments
+
+| Variable | Meaning |
+|---|---|
+| `DS4_EXPERT_TRACE=FILE` | Writes JSONL prompt, route, weight, and cache-state records. This is the corrected trace variable; the old mismatched name is not used. |
+| `DS4_EXPERT_TRACE_LOGITS=1` | Adds logit-related information to expert traces; high overhead. |
+| `DS4_CUDA_PREFIX_EXPERT_PROFILE=1` | Prints prefix observations, admissions, and rejections. |
+| `DS4_CUDA_CACHE_SUMMARY=1` | Prints cache-policy summaries. |
+| `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1` | Prints detailed model-cache activity and primary/replica byte totals at shutdown. |
+| `DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE=1` | Profiles single selected-expert cache operations. |
+| `DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_PROFILE=1` | Profiles batched prefill selected-expert loading. |
+| `DS4_CUDA_PREFETCH_TELEMETRY=1` | Reports async load jobs, queue contention, service time, caller waits, and waste. |
+| `DS4_CUDA_SESSION_BATCH_PROFILE=1` | Reports unioned server-batch routed dispatch/load statistics per layer. |
+| `DS4_CUDA_SESSION_BATCH_SSD_UNION=1` | Enables the experimental single-GPU SSD cross-session union loader. Measured slower; default off. |
+| `DS4_CUDA_SESSION_BATCH_INTERLEAVE=0` | Disables the interleaved native session pipeline for comparison. |
+| `DS4_CUDA_SESSION_BATCH_MOE=0` | Disables grouped routed-MoE server execution for comparison. |
+| `DS4_CUDA_SESSION_BATCH_SHARED=0` | Disables grouped shared-FFN server execution for comparison. |
+
+### Kernel and transfer rollback switches
+
+These are developer controls for isolating regressions, not recommended tuning
+knobs:
+
+- `DS4_CUDA_DISABLE_STREAMING_TRANSFER_GROUPS=1`
+- `DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_LOAD=1`
+- `DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP=1`
+- `DS4_CUDA_NO_TOPK2048=1`
+- `DS4_CUDA_NO_TOPK_STREAM=1`
+- `DS4_CUDA_MMQ_LOG=1`
+
+## Credits and thanks
+
+This fork exists only because of the original
+[DwarfStar project](https://github.com/antirez/ds4). Deep thanks to **Salvatore
+Sanfilippo (antirez)** for creating and openly developing DwarfStar, its model-
+specific inference architecture, tooling, documentation, and testing culture.
+Thank you to **Donato Capitella, Ivan Fioravanti, Entrpi, Armin Ronacher, Luigi
+Colluto, Rui Gu, Carlos Villela, Chida82, Rinaldo Festa**, and every other
+[DwarfStar contributor](https://github.com/antirez/ds4/graphs/contributors),
+reviewer, tester, model publisher, and community member. The contributor link
+is the complete and current credit; the names here are not intended to exclude
+anyone.
+
+DwarfStar itself stands on the work of **Georgi Gerganov** and all contributors
+to [llama.cpp](https://github.com/ggml-org/llama.cpp),
+[GGML](https://github.com/ggml-org/ggml), GGUF, and the quantization/kernel
+ecosystem. This fork preserves the upstream MIT licensing and acknowledgements.
+Thanks also to DeepSeek and the open-model community for making the weights and
+research available, to NVIDIA and CUDA contributors for the Blackwell toolchain,
+and to everyone whose testing and issue reports improved the original project.
+
+Development of both upstream and this fork used substantial AI assistance.
+Humans selected the goals, reviewed behavior, ran the hardware experiments, and
+accepted or rejected changes using correctness and performance evidence.
+
+---
+
+# Original DwarfStar project documentation
+
+The following documentation is retained from upstream because most model,
+server, agent, API, distributed, and GGUF instructions still apply. When an
+upstream recommendation conflicts with the RTX 5080 profile above, use the
+fork-specific instructions above for this branch.
+
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
 machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
