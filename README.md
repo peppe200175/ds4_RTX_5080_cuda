@@ -136,7 +136,6 @@ Clone this fork and select its optimized branch:
 ```sh
 git clone https://github.com/peppe200175/ds4.git
 cd ds4
-git switch local/ds4-cuda-definitive
 ```
 
 Download the supported routed IQ2/Q2 model using the upstream helper:
