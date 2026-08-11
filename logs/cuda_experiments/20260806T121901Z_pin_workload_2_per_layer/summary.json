@@ -1,0 +1,316 @@
+{
+  "schema": "ds4-cuda-experiment-summary-v1",
+  "config": {
+    "experiment": "pin_workload_2_per_layer",
+    "run_id": "20260806T121901Z",
+    "git_commit": "b0309611041655f4e45671cfd9c9886aff161406",
+    "model": "/home/peppe200175/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+    "model_size": "86720111488",
+    "max_tokens": "32",
+    "cache_budget": "10GB",
+    "max_gpu_temp_c": "78",
+    "start_gpu_temp_c": "72",
+    "DS4_BENCH_MAX_GPU_TEMP": "78",
+    "DS4_CUDA_CACHE_SUMMARY": "1",
+    "DS4_CUDA_DECODE_CACHE_EXTRA_EXPERTS": "0",
+    "DS4_CUDA_DECODE_CACHE_LRU": "1",
+    "DS4_CUDA_LAYER_CACHE_CAPACITIES_FILE": "0",
+    "DS4_CUDA_MMQ": "0",
+    "DS4_CUDA_NO_Q8_F16_CACHE": "1",
+    "DS4_CUDA_PINNED_EXPERTS_FILE": "/mnt/c/Users/gmart/OneDrive/ds4/logs/expert_trace_10prompts_20260806T110937Z/analysis/recommended_pinned_experts.txt",
+    "DS4_CUDA_PROMPT_EXPERT_CACHE": "0",
+    "DS4_CUDA_STREAMING_PERSISTENT_READERS": "1",
+    "DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP": "0",
+    "DS4_CUDA_STREAMING_READ_THREADS": "4",
+    "DS4_CUDA_STREAMING_SMALL_MISS_PARALLEL": "1",
+    "DS4_CUDA_WEIGHT_ARENA_CHUNK_MB": "256",
+    "DS4_LOCK_FILE": "/tmp/ds4-cuda-experiment-20260806T121901Z-pin_workload_2_per_layer.lock"
+  },
+  "summary": {
+    "successful_prompts": 10,
+    "failed_prompts": 0,
+    "total_elapsed_s": 180.84190230600325,
+    "mean_request_s": 18.084190230600324,
+    "median_request_s": 17.840585283499422,
+    "p95_request_s": 30.470352459000424,
+    "total_prompt_tokens": 268,
+    "total_completion_tokens": 183,
+    "weighted_end_to_end_completion_tps": 1.0119336153097143,
+    "prefill_seconds": 89.05799999999999,
+    "decode_seconds": 91.691,
+    "prefill_tokens_per_second": 3.0092748545891443,
+    "decode_tokens_per_second": 1.9958338332006413,
+    "cache_prompt_summaries": 9,
+    "cache_hits": 30324,
+    "cache_misses": 30004,
+    "cache_hit_rate": 0.5026521681474605,
+    "cache_evictions": 19197,
+    "cache_ssd_gib": 197.79,
+    "cache_per_prompt": [
+      {
+        "hits": 1988,
+        "misses": 2876,
+        "evictions": 1196,
+        "ssd_gib": 18.96,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 1641,
+        "misses": 2148,
+        "evictions": 1246,
+        "ssd_gib": 14.16,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 1715,
+        "misses": 2632,
+        "evictions": 1528,
+        "ssd_gib": 17.35,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 4531,
+        "misses": 4284,
+        "evictions": 2602,
+        "ssd_gib": 28.24,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 5962,
+        "misses": 4977,
+        "evictions": 3597,
+        "ssd_gib": 32.81,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 5993,
+        "misses": 4625,
+        "evictions": 3531,
+        "ssd_gib": 30.49,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 1759,
+        "misses": 2655,
+        "evictions": 1674,
+        "ssd_gib": 17.5,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 2095,
+        "misses": 2492,
+        "evictions": 1481,
+        "ssd_gib": 16.43,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 4640,
+        "misses": 3315,
+        "evictions": 2342,
+        "ssd_gib": 21.85,
+        "capacity": 1005,
+        "resident": 1005
+      }
+    ]
+  },
+  "results": [
+    {
+      "id": "fact",
+      "category": "conoscenza",
+      "prompt": "Qual è la capitale del Portogallo? Rispondi con una sola frase.",
+      "status": "ok",
+      "elapsed_s": 14.677032837998922,
+      "prompt_tokens": 21,
+      "completion_tokens": 11,
+      "total_tokens": 32,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.749470286086772,
+      "answer": "La capitale del Portogallo è Lisbona.",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "arithmetic",
+      "category": "calcolo",
+      "prompt": "Calcola 17 × 24 e mostra soltanto il risultato.",
+      "status": "ok",
+      "elapsed_s": 22.170496750000893,
+      "prompt_tokens": 20,
+      "completion_tokens": 7,
+      "total_tokens": 27,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.31573491920065877,
+      "answer": "17 × 24 = 408",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "translation",
+      "category": "traduzione",
+      "prompt": "Traduci in inglese: 'Il treno arriverà tra dieci minuti'.",
+      "status": "ok",
+      "elapsed_s": 8.8562183060003,
+      "prompt_tokens": 24,
+      "completion_tokens": 8,
+      "total_tokens": 32,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.9033200993453162,
+      "answer": "'The train will arrive in ten minutes.'",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "summary",
+      "category": "riassunto",
+      "prompt": "Riassumi in non più di 15 parole: Marta uscì presto, comprò il pane e tornò a casa prima che iniziasse la pioggia.",
+      "status": "ok",
+      "elapsed_s": 25.124743524000223,
+      "prompt_tokens": 42,
+      "completion_tokens": 22,
+      "total_tokens": 64,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.8756308289867581,
+      "answer": "Marta uscì, comprò il pane e rientrò prima della pioggia.",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "sentiment",
+      "category": "classificazione",
+      "prompt": "Classifica come positivo, neutro o negativo: 'Il pacco è arrivato puntuale e in perfette condizioni'.",
+      "status": "ok",
+      "elapsed_s": 20.479630711000937,
+      "prompt_tokens": 29,
+      "completion_tokens": 32,
+      "total_tokens": 61,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.5625281750227422,
+      "answer": "Il testo esprime un'esperienza positiva con la consegna del pacco, evidenziando puntualità e condizioni perfette.  \nClassificazione",
+      "finish_reason": "length"
+    },
+    {
+      "id": "python",
+      "category": "codice",
+      "prompt": "Scrivi una funzione Python di una riga che restituisca il quadrato di ogni numero in una lista.",
+      "status": "ok",
+      "elapsed_s": 30.470352459000424,
+      "prompt_tokens": 29,
+      "completion_tokens": 32,
+      "total_tokens": 61,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.050201176473354,
+      "answer": "Ecco una funzione Python di una riga che restituisce il quadrato di ogni numero in una lista:\n\n```python\nquadrati = lambda lista:",
+      "finish_reason": "length"
+    },
+    {
+      "id": "logic",
+      "category": "logica",
+      "prompt": "Anna è più alta di Luca e Luca è più alto di Marco. Chi è il più basso? Rispondi brevemente.",
+      "status": "ok",
+      "elapsed_s": 9.677594849001252,
+      "prompt_tokens": 32,
+      "completion_tokens": 8,
+      "total_tokens": 40,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.8266516758371649,
+      "answer": "Marco è il più basso.",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "formatting",
+      "category": "formattazione",
+      "prompt": "Elenca tre pianeti rocciosi separandoli soltanto con virgole.",
+      "status": "ok",
+      "elapsed_s": 18.67293092900036,
+      "prompt_tokens": 24,
+      "completion_tokens": 9,
+      "total_tokens": 33,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.4819811112792355,
+      "answer": "Mercurio, Venere, Marte",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "creative",
+      "category": "scrittura",
+      "prompt": "Scrivi un micro-haiku italiano sul mare, massimo 12 parole.",
+      "status": "ok",
+      "elapsed_s": 13.704662302001452,
+      "prompt_tokens": 21,
+      "completion_tokens": 22,
+      "total_tokens": 43,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.6052931123145648,
+      "answer": "Onda che respira,\nschiuma bianca sul grano,\nil mare è un sogno.",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "practical",
+      "category": "consiglio",
+      "prompt": "Suggerisci due modi semplici per ridurre gli sprechi d'acqua in casa.",
+      "status": "ok",
+      "elapsed_s": 17.008239637998486,
+      "prompt_tokens": 26,
+      "completion_tokens": 32,
+      "total_tokens": 58,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.8814410357029594,
+      "answer": "Ecco due modi semplici ed efficaci per ridurre gli sprechi d'acqua in casa:\n\n**1. Installare riduttori di fl",
+      "finish_reason": "length"
+    }
+  ],
+  "correctness": {
+    "exact_match": false,
+    "differences": [
+      {
+        "id": "creative",
+        "changed": {
+          "answer": {
+            "reference": "Onda che respira,\nschiuma bianca sul blu,\nil mare sogna.",
+            "candidate": "Onda che respira,\nschiuma bianca sul grano,\nil mare è un sogno."
+          },
+          "completion_tokens": {
+            "reference": 20,
+            "candidate": 22
+          }
+        }
+      }
+    ]
+  },
+  "comparison": {
+    "total_elapsed_s": {
+      "reference": 166.12125706700135,
+      "candidate": 180.84190230600325,
+      "change_rate": 0.0886138565220744
+    },
+    "prefill_seconds": {
+      "reference": 85.857,
+      "candidate": 89.05799999999999,
+      "change_rate": 0.03728292393165372
+    },
+    "decode_seconds": {
+      "reference": 80.16199999999999,
+      "candidate": 91.691,
+      "change_rate": 0.1438212619445624
+    },
+    "weighted_end_to_end_completion_tps": {
+      "reference": 1.0895655570857956,
+      "candidate": 1.0119336153097143,
+      "change_rate": -0.0712503632949994
+    },
+    "prefill_tokens_per_second": {
+      "reference": 3.1214694200822297,
+      "candidate": 3.0092748545891443,
+      "change_rate": -0.0359428686923128
+    },
+    "decode_tokens_per_second": {
+      "reference": 2.2579276964147605,
+      "candidate": 1.9958338332006413,
+      "change_rate": -0.11607717272359237
+    }
+  }
+}

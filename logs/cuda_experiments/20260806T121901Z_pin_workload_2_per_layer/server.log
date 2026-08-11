@@ -1,0 +1,76 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 5080 Laptop GPU (sm_120) dev=0
+ds4: cuda SSD streaming total expert budget 10.00 GiB = 3.38 GiB prefill headroom + 6.62 GiB dynamic cache (1005 experts, 6.75 MiB each)
+ds4: SSD streaming initial cuda model map restricted to token embedding (1 spans, 0.99 GiB tensor span)
+ds4: CUDA host registration skipped: out of memory
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.556s
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 0.07 GiB (raw 0.02 + compressed 0.05) + buffers 0.00 GiB + resident model 0.99 GiB + expert cache 6.62 GiB + prefill expert reserve 3.38 GiB = 11.06 GiB planned
+ds4: memory detail: ctx=4096 prefill_cap=128 raw_kv_rows=256 compressed_kv_rows=1026 backend=cuda
+0806 14:19:02 ds4-server: context buffers 76.50 MiB (ctx=4096, backend=cuda, prefill_chunk=128, raw_kv_rows=256, compressed_kv_rows=1026)
+0806 14:19:02 ds4-server: listening on http://127.0.0.1:18080
+0806 14:19:02 ds4-server: chat ctx=0..21:21 prompt start
+ds4: DS4_CUDA_MMQ=0 - mmq prefill tier disabled
+ds4: CUDA layer-pinned expert profile loaded 86 experts from /mnt/c/Users/gmart/OneDrive/ds4/logs/expert_trace_10prompts_20260806T110937Z/analysis/recommended_pinned_experts.txt (up to 2 per layer, lazy admission)
+ds4: CUDA layer expert cache allocated 6.62 GiB (1005 prefill experts, 1005 decode experts across 43 layers)
+ds4: CUDA loading model tensors 7.16 GiB cached
+0806 14:19:10 ds4-server: chat ctx=0..21:21 prompt done 10.541s
+0806 14:19:14 ds4-server: chat ctx=21..32:11 gen=11 decoding chunk=2.67 t/s avg=2.67 t/s 4.115s
+0806 14:19:14 ds4-server: chat ctx=0..21:21 gen=11 finish=stop 14.659s
+0806 14:19:14 ds4-server: live kv cache miss live=32 prompt=20 common=2 reason=token-mismatch
+0806 14:19:14 ds4-server: chat ctx=0..20:20 prompt start
+ds4: CUDA prompt expert cache summary hits=1988 misses=2876 evictions=1196 SSD=18.96 GiB capacity=1005 resident=1005
+0806 14:19:33 ds4-server: chat ctx=0..20:20 prompt done 19.208s
+0806 14:19:34 ds4-server: chat ctx=20..27:7 gen=7 decoding chunk=2.37 t/s avg=2.37 t/s 2.954s
+0806 14:19:34 ds4-server: chat ctx=0..20:20 gen=7 finish=stop 22.165s
+0806 14:19:34 ds4-server: live kv cache miss live=27 prompt=24 common=2 reason=token-mismatch
+0806 14:19:34 ds4-server: chat ctx=0..24:24 prompt start
+ds4: CUDA prompt expert cache summary hits=1641 misses=2148 evictions=1246 SSD=14.16 GiB capacity=1005 resident=1005
+0806 14:19:39 ds4-server: chat ctx=0..24:24 prompt done 5.357s
+0806 14:19:43 ds4-server: chat ctx=24..32:8 gen=8 decoding chunk=2.29 t/s avg=2.29 t/s 3.492s
+0806 14:19:43 ds4-server: chat ctx=0..24:24 gen=8 finish=stop 8.852s
+0806 14:19:43 ds4-server: live kv cache miss live=32 prompt=42 common=2 reason=token-mismatch
+0806 14:19:43 ds4-server: chat ctx=0..42:42 prompt start
+ds4: CUDA prompt expert cache summary hits=1715 misses=2632 evictions=1528 SSD=17.35 GiB capacity=1005 resident=1005
+0806 14:19:54 ds4-server: chat ctx=0..42:42 prompt done 11.033s
+0806 14:20:05 ds4-server: chat ctx=42..64:22 gen=22 decoding chunk=1.56 t/s avg=1.56 t/s 14.085s
+0806 14:20:05 ds4-server: chat ctx=0..42:42 gen=22 finish=stop 25.121s
+0806 14:20:05 ds4-server: live kv cache miss live=64 prompt=29 common=2 reason=token-mismatch
+0806 14:20:05 ds4-server: chat ctx=0..29:29 prompt start
+ds4: CUDA prompt expert cache summary hits=4531 misses=4284 evictions=2602 SSD=28.24 GiB capacity=1005 resident=1005
+0806 14:20:12 ds4-server: chat ctx=0..29:29 prompt done 6.728s
+0806 14:20:25 ds4-server: chat ctx=29..61:32 gen=32 decoding chunk=2.33 t/s avg=2.33 t/s 13.744s
+0806 14:20:25 ds4-server: chat ctx=0..29:29 gen=32 finish=length 20.476s
+0806 14:20:25 ds4-server: live kv cache miss live=61 prompt=29 common=2 reason=token-mismatch
+0806 14:20:25 ds4-server: chat ctx=0..29:29 prompt start
+ds4: CUDA prompt expert cache summary hits=5962 misses=4977 evictions=3597 SSD=32.81 GiB capacity=1005 resident=1005
+0806 14:20:31 ds4-server: chat ctx=0..29:29 prompt done 8.398s
+0806 14:20:53 ds4-server: chat ctx=29..61:32 gen=32 decoding chunk=1.45 t/s avg=1.45 t/s 22.064s
+0806 14:20:53 ds4-server: chat ctx=0..29:29 gen=32 finish=length 30.465s
+0806 14:20:53 ds4-server: live kv cache miss live=61 prompt=32 common=2 reason=token-mismatch
+0806 14:20:53 ds4-server: chat ctx=0..32:32 prompt start
+ds4: CUDA prompt expert cache summary hits=5993 misses=4625 evictions=3531 SSD=30.49 GiB capacity=1005 resident=1005
+0806 14:21:00 ds4-server: chat ctx=0..32:32 prompt done 6.560s
+0806 14:21:03 ds4-server: chat ctx=32..40:8 gen=8 decoding chunk=2.57 t/s avg=2.57 t/s 3.110s
+0806 14:21:03 ds4-server: chat ctx=0..32:32 gen=8 finish=stop 9.673s
+0806 14:21:03 ds4-server: live kv cache miss live=40 prompt=24 common=2 reason=token-mismatch
+0806 14:21:03 ds4-server: chat ctx=0..24:24 prompt start
+ds4: CUDA prompt expert cache summary hits=1759 misses=2655 evictions=1674 SSD=17.50 GiB capacity=1005 resident=1005
+0806 14:21:09 ds4-server: chat ctx=0..24:24 prompt done 8.953s
+0806 14:21:19 ds4-server: chat ctx=24..33:9 gen=9 decoding chunk=0.93 t/s avg=0.93 t/s 9.714s
+0806 14:21:19 ds4-server: chat ctx=0..24:24 gen=9 finish=stop 18.669s
+0806 14:21:19 ds4-server: live kv cache miss live=33 prompt=21 common=2 reason=token-mismatch
+0806 14:21:19 ds4-server: chat ctx=0..21:21 prompt start
+ds4: CUDA prompt expert cache summary hits=2095 misses=2492 evictions=1481 SSD=16.43 GiB capacity=1005 resident=1005
+0806 14:21:25 ds4-server: chat ctx=0..21:21 prompt done 6.324s
+0806 14:21:33 ds4-server: chat ctx=21..43:22 gen=22 decoding chunk=2.98 t/s avg=2.98 t/s 7.372s
+0806 14:21:33 ds4-server: chat ctx=0..21:21 gen=22 finish=stop 13.700s
+0806 14:21:33 ds4-server: live kv cache miss live=43 prompt=26 common=2 reason=token-mismatch
+0806 14:21:33 ds4-server: chat ctx=0..26:26 prompt start
+ds4: CUDA prompt expert cache summary hits=4640 misses=3315 evictions=2342 SSD=21.85 GiB capacity=1005 resident=1005
+0806 14:21:36 ds4-server: chat ctx=0..26:26 prompt done 5.956s
+0806 14:21:47 ds4-server: chat ctx=26..58:32 gen=32 decoding chunk=2.90 t/s avg=2.90 t/s 11.041s
+0806 14:21:47 ds4-server: chat ctx=0..26:26 gen=32 finish=length 17.001s
+0806 14:21:47 ds4-server: shutdown requested, draining requests

@@ -197,6 +197,7 @@ typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
     uint32_t    layer;
+    uint32_t    n_layer;
     uint32_t    n_total_expert;
     uint64_t    gate_offset;
     uint64_t    up_offset;
@@ -204,6 +205,99 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
+
+/* CUDA SSD streaming stages the routed experts for one layer in a compact
+ * device buffer backed by a persistent, layer-partitioned expert cache.  This
+ * snapshot is intentionally plain C so the graph driver can include the cache
+ * state in optional JSONL traces without exposing CUDA implementation types. */
+#define DS4_GPU_STREAM_EXPERT_SNAPSHOT_MAX_EXPERTS 384u
+typedef struct ds4_gpu_stream_expert_cache_snapshot {
+    int      valid;
+    int      logical_tier;
+    uint32_t layer;
+    uint32_t n_total_expert;
+    uint32_t slot_count;
+    uint32_t compact_count;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t gate_capacity;
+    uint64_t up_capacity;
+    uint64_t down_capacity;
+    uint64_t selected_capacity;
+    uint64_t live_weight_bytes;
+    uint64_t live_remap_bytes;
+    uint64_t load_generation;
+    uint64_t total_loads;
+    uint64_t total_loaded_experts;
+    uint64_t total_bytes_copied;
+    uint64_t last_bytes_copied;
+    int      last_gate_allocation_reused;
+    int      last_up_allocation_reused;
+    int      last_down_allocation_reused;
+    int      last_selected_allocation_reused;
+    uint32_t persistent_capacity_experts;
+    uint32_t persistent_resident_experts;
+    uint32_t persistent_layer_capacity;
+    uint32_t persistent_layer_resident;
+    uint64_t persistent_bytes;
+    uint64_t persistent_hits;
+    uint64_t persistent_misses;
+    uint64_t persistent_evictions;
+    uint64_t persistent_insertions;
+    uint64_t persistent_model_bytes_read;
+    uint64_t persistent_cache_hit_bytes;
+    uint32_t last_persistent_hits;
+    uint32_t last_persistent_misses;
+    uint32_t last_persistent_evictions;
+    uint32_t last_persistent_insertions;
+    uint64_t last_model_bytes_read;
+    uint64_t last_cache_hit_bytes;
+    int      prompt_policy_enabled;
+    uint32_t prompt_policy_phase;
+    uint64_t prompt_generation;
+    uint64_t decode_token;
+    uint32_t prompt_protected_resident;
+    uint32_t session_protected_resident;
+    uint64_t prefill_probation_admissions;
+    uint64_t prefill_single_use_bypasses;
+    uint64_t decode_reserve_admissions;
+    uint64_t protected_victim_skips;
+    uint64_t prompt_protected_hits;
+    uint64_t session_protected_hits;
+    int      pinned_policy_enabled;
+    uint32_t pinned_profile_experts;
+    uint32_t pinned_resident_experts;
+    uint64_t pinned_hits;
+    uint64_t pinned_admissions;
+    uint64_t pinned_victim_skips;
+    uint32_t last_prefill_probation_admissions;
+    uint32_t last_prefill_single_use_bypasses;
+    uint32_t last_decode_reserve_admissions;
+    uint32_t last_protected_victim_skips;
+    uint32_t last_pinned_hits;
+    uint32_t last_pinned_admissions;
+    uint32_t last_pinned_victim_skips;
+    uint32_t compact_ids_count;
+    int32_t  compact_ids[DS4_GPU_STREAM_EXPERT_SNAPSHOT_MAX_EXPERTS];
+    int32_t  compact_persistent_slots[DS4_GPU_STREAM_EXPERT_SNAPSHOT_MAX_EXPERTS];
+    uint8_t  compact_persistent_hits[DS4_GPU_STREAM_EXPERT_SNAPSHOT_MAX_EXPERTS];
+    uint32_t persistent_layer_ids_count;
+    int32_t  persistent_layer_ids[DS4_GPU_STREAM_EXPERT_SNAPSHOT_MAX_EXPERTS];
+    int32_t  persistent_layer_slots[DS4_GPU_STREAM_EXPERT_SNAPSHOT_MAX_EXPERTS];
+    uint8_t  persistent_layer_pinned[DS4_GPU_STREAM_EXPERT_SNAPSHOT_MAX_EXPERTS];
+} ds4_gpu_stream_expert_cache_snapshot;
+
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+int ds4_gpu_stream_expert_cache_get_snapshot(
+        ds4_gpu_stream_expert_cache_snapshot *out);
+void ds4_gpu_stream_expert_cache_prompt_begin(uint64_t prefix_key,
+                                               uint32_t cached_tokens);
+void ds4_gpu_stream_expert_cache_prefill_end(void);
+void ds4_gpu_stream_expert_cache_prompt_end(void);
+#endif
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
@@ -235,6 +329,10 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const int32_t                     *selected_ids,
         uint32_t                           n_tokens,
         uint32_t                           n_selected);
+#endif
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+int ds4_gpu_stream_expert_cache_set_selected_slot_offset(
+        uint32_t                           slot_offset);
 #endif
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_stream_expert_cache_load_layer(

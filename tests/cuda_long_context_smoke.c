@@ -86,6 +86,97 @@ cleanup:
     return rc;
 }
 
+static int check_decode_topk_stream(void) {
+    const char *n_comp_env = getenv("DS4_CUDA_TEST_DECODE_TOPK_N_COMP");
+    const uint32_t n_comp = n_comp_env && n_comp_env[0]
+        ? (uint32_t)strtoul(n_comp_env, NULL, 10) : 32768u;
+    const uint32_t top_k = 512;
+    const uint32_t repetitions = 100;
+    float *scores_host = (float *)malloc((size_t)n_comp * sizeof(float));
+    uint32_t *baseline_host = (uint32_t *)malloc((size_t)top_k * sizeof(uint32_t));
+    uint32_t *stream_host = (uint32_t *)malloc((size_t)top_k * sizeof(uint32_t));
+    if (!scores_host || !baseline_host || !stream_host) return 1;
+
+    uint32_t state = 0x8c032fc1u;
+    for (uint32_t i = 0; i < n_comp; i++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        scores_host[i] = (float)(state & 0x00ffffffu) / 16777216.0f;
+    }
+
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc((uint64_t)n_comp * sizeof(float));
+    ds4_gpu_tensor *baseline = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t));
+    ds4_gpu_tensor *stream = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t));
+    int rc = 1;
+    double baseline_seconds = 0.0;
+    double stream_seconds = 0.0;
+    if (!scores || !baseline || !stream ||
+        !ds4_gpu_tensor_write(scores, 0, scores_host, (uint64_t)n_comp * sizeof(float))) {
+        goto cleanup;
+    }
+    if (setenv("DS4_CUDA_NO_TOPK_STREAM", "1", 1) != 0) goto cleanup;
+    if (!ds4_gpu_indexer_topk_tensor(baseline, scores, n_comp, 1, top_k)) {
+        goto cleanup;
+    }
+    unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+    if (!ds4_gpu_indexer_topk_tensor(stream, scores, n_comp, 1, top_k) ||
+        !ds4_gpu_synchronize()) {
+        goto cleanup;
+    }
+    for (uint32_t round = 0; round < 4u; round++) {
+        if (setenv("DS4_CUDA_NO_TOPK_STREAM", "1", 1) != 0) goto cleanup;
+        double t0 = monotonic_seconds();
+        for (uint32_t i = 0; i < repetitions; i++) {
+            if (!ds4_gpu_indexer_topk_tensor(baseline, scores, n_comp, 1, top_k)) goto cleanup;
+        }
+        if (!ds4_gpu_synchronize()) goto cleanup;
+        baseline_seconds += monotonic_seconds() - t0;
+
+        unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+        t0 = monotonic_seconds();
+        for (uint32_t i = 0; i < repetitions; i++) {
+            if (!ds4_gpu_indexer_topk_tensor(stream, scores, n_comp, 1, top_k)) goto cleanup;
+        }
+        if (!ds4_gpu_synchronize()) goto cleanup;
+        stream_seconds += monotonic_seconds() - t0;
+    }
+    if (!ds4_gpu_tensor_read(baseline, 0, baseline_host,
+                             (uint64_t)top_k * sizeof(uint32_t)) ||
+        !ds4_gpu_tensor_read(stream, 0, stream_host,
+                             (uint64_t)top_k * sizeof(uint32_t))) {
+        goto cleanup;
+    }
+    rc = 0;
+    for (uint32_t i = 0; i < top_k; i++) {
+        if (baseline_host[i] != stream_host[i]) {
+            fprintf(stderr,
+                    "decode streaming top-k mismatch rank=%u baseline=%u stream=%u\n",
+                    i, baseline_host[i], stream_host[i]);
+            rc = 1;
+            break;
+        }
+    }
+    if (rc == 0) {
+        const double calls = 4.0 * repetitions;
+        const double baseline_ms = baseline_seconds * 1000.0 / calls;
+        const double stream_ms = stream_seconds * 1000.0 / calls;
+        fprintf(stderr,
+                "cuda-regression: decode top-k n_comp=%u tree=%.3fms stream=%.3fms speedup=%.3fx exact=yes\n",
+                n_comp, baseline_ms, stream_ms, baseline_ms / stream_ms);
+    }
+
+cleanup:
+    unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+    ds4_gpu_tensor_free(stream);
+    ds4_gpu_tensor_free(baseline);
+    ds4_gpu_tensor_free(scores);
+    free(stream_host);
+    free(baseline_host);
+    free(scores_host);
+    return rc;
+}
+
 static int check_decode_attention_overflow_path(void) {
     const uint32_t n_head = 8;
     const uint32_t head_dim = 512;
@@ -159,6 +250,7 @@ static int check_decode_attention_overflow_path(void) {
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
+    if (check_decode_topk_stream() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");

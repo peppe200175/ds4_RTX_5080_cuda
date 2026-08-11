@@ -1,0 +1,301 @@
+{
+  "schema": "ds4-cuda-experiment-summary-v1",
+  "config": {
+    "experiment": "steady_baseline_78c",
+    "run_id": "20260806T121545Z",
+    "git_commit": "b0309611041655f4e45671cfd9c9886aff161406",
+    "model": "/home/peppe200175/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+    "model_size": "86720111488",
+    "max_tokens": "32",
+    "cache_budget": "10GB",
+    "max_gpu_temp_c": "78",
+    "start_gpu_temp_c": "77",
+    "DS4_BENCH_MAX_GPU_TEMP": "78",
+    "DS4_CUDA_CACHE_SUMMARY": "1",
+    "DS4_CUDA_DECODE_CACHE_EXTRA_EXPERTS": "0",
+    "DS4_CUDA_DECODE_CACHE_LRU": "1",
+    "DS4_CUDA_LAYER_CACHE_CAPACITIES_FILE": "0",
+    "DS4_CUDA_MMQ": "0",
+    "DS4_CUDA_NO_Q8_F16_CACHE": "1",
+    "DS4_CUDA_PROMPT_EXPERT_CACHE": "0",
+    "DS4_CUDA_STREAMING_PERSISTENT_READERS": "1",
+    "DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP": "0",
+    "DS4_CUDA_STREAMING_READ_THREADS": "4",
+    "DS4_CUDA_STREAMING_SMALL_MISS_PARALLEL": "1",
+    "DS4_CUDA_WEIGHT_ARENA_CHUNK_MB": "256",
+    "DS4_LOCK_FILE": "/tmp/ds4-cuda-experiment-20260806T121545Z-steady_baseline_78c.lock"
+  },
+  "summary": {
+    "successful_prompts": 10,
+    "failed_prompts": 0,
+    "total_elapsed_s": 166.12125706700135,
+    "mean_request_s": 16.612125706700134,
+    "median_request_s": 16.38906987000064,
+    "p95_request_s": 23.549411545000112,
+    "total_prompt_tokens": 268,
+    "total_completion_tokens": 181,
+    "weighted_end_to_end_completion_tps": 1.0895655570857956,
+    "prefill_seconds": 85.857,
+    "decode_seconds": 80.16199999999999,
+    "prefill_tokens_per_second": 3.1214694200822297,
+    "decode_tokens_per_second": 2.2579276964147605,
+    "cache_prompt_summaries": 9,
+    "cache_hits": 29815,
+    "cache_misses": 29997,
+    "cache_hit_rate": 0.49847856617401193,
+    "cache_evictions": 19195,
+    "cache_ssd_gib": 197.72,
+    "cache_per_prompt": [
+      {
+        "hits": 1990,
+        "misses": 2874,
+        "evictions": 1187,
+        "ssd_gib": 18.94,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 1613,
+        "misses": 2176,
+        "evictions": 1260,
+        "ssd_gib": 14.34,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 1701,
+        "misses": 2646,
+        "evictions": 1524,
+        "ssd_gib": 17.44,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 4524,
+        "misses": 4291,
+        "evictions": 2613,
+        "ssd_gib": 28.29,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 5959,
+        "misses": 4980,
+        "evictions": 3608,
+        "ssd_gib": 32.83,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 5968,
+        "misses": 4650,
+        "evictions": 3570,
+        "ssd_gib": 30.65,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 1727,
+        "misses": 2687,
+        "evictions": 1720,
+        "ssd_gib": 17.71,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 2068,
+        "misses": 2519,
+        "evictions": 1506,
+        "ssd_gib": 16.6,
+        "capacity": 1005,
+        "resident": 1005
+      },
+      {
+        "hits": 4265,
+        "misses": 3174,
+        "evictions": 2207,
+        "ssd_gib": 20.92,
+        "capacity": 1005,
+        "resident": 1005
+      }
+    ]
+  },
+  "results": [
+    {
+      "id": "fact",
+      "category": "conoscenza",
+      "prompt": "Qual è la capitale del Portogallo? Rispondi con una sola frase.",
+      "status": "ok",
+      "elapsed_s": 16.422594417001164,
+      "prompt_tokens": 21,
+      "completion_tokens": 11,
+      "total_tokens": 32,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.6698089059918857,
+      "answer": "La capitale del Portogallo è Lisbona.",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "arithmetic",
+      "category": "calcolo",
+      "prompt": "Calcola 17 × 24 e mostra soltanto il risultato.",
+      "status": "ok",
+      "elapsed_s": 12.046640930000649,
+      "prompt_tokens": 20,
+      "completion_tokens": 7,
+      "total_tokens": 27,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.5810748440727056,
+      "answer": "17 × 24 = 408",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "translation",
+      "category": "traduzione",
+      "prompt": "Traduci in inglese: 'Il treno arriverà tra dieci minuti'.",
+      "status": "ok",
+      "elapsed_s": 10.279608762000862,
+      "prompt_tokens": 24,
+      "completion_tokens": 8,
+      "total_tokens": 32,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.7782397351125306,
+      "answer": "'The train will arrive in ten minutes.'",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "summary",
+      "category": "riassunto",
+      "prompt": "Riassumi in non più di 15 parole: Marta uscì presto, comprò il pane e tornò a casa prima che iniziasse la pioggia.",
+      "status": "ok",
+      "elapsed_s": 19.203822853998645,
+      "prompt_tokens": 42,
+      "completion_tokens": 22,
+      "total_tokens": 64,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.145605235335689,
+      "answer": "Marta uscì, comprò il pane e rientrò prima della pioggia.",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "sentiment",
+      "category": "classificazione",
+      "prompt": "Classifica come positivo, neutro o negativo: 'Il pacco è arrivato puntuale e in perfette condizioni'.",
+      "status": "ok",
+      "elapsed_s": 22.756512296999063,
+      "prompt_tokens": 29,
+      "completion_tokens": 32,
+      "total_tokens": 61,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.4061908776864673,
+      "answer": "Il testo esprime un'esperienza positiva con la consegna del pacco, evidenziando puntualità e condizioni perfette.  \nClassificazione",
+      "finish_reason": "length"
+    },
+    {
+      "id": "python",
+      "category": "codice",
+      "prompt": "Scrivi una funzione Python di una riga che restituisca il quadrato di ogni numero in una lista.",
+      "status": "ok",
+      "elapsed_s": 21.777995880000162,
+      "prompt_tokens": 29,
+      "completion_tokens": 32,
+      "total_tokens": 61,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.4693730394809754,
+      "answer": "Ecco una funzione Python di una riga che restituisce il quadrato di ogni numero in una lista:\n\n```python\nquadrati = lambda lista:",
+      "finish_reason": "length"
+    },
+    {
+      "id": "logic",
+      "category": "logica",
+      "prompt": "Anna è più alta di Luca e Luca è più alto di Marco. Chi è il più basso? Rispondi brevemente.",
+      "status": "ok",
+      "elapsed_s": 12.162768825999592,
+      "prompt_tokens": 32,
+      "completion_tokens": 8,
+      "total_tokens": 40,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.6577449686373138,
+      "answer": "Marco è il più basso.",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "formatting",
+      "category": "formattazione",
+      "prompt": "Elenca tre pianeti rocciosi separandoli soltanto con virgole.",
+      "status": "ok",
+      "elapsed_s": 11.566356233000988,
+      "prompt_tokens": 24,
+      "completion_tokens": 9,
+      "total_tokens": 33,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 0.7781188663653043,
+      "answer": "Mercurio, Venere, Marte",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "creative",
+      "category": "scrittura",
+      "prompt": "Scrivi un micro-haiku italiano sul mare, massimo 12 parole.",
+      "status": "ok",
+      "elapsed_s": 16.355545323000115,
+      "prompt_tokens": 21,
+      "completion_tokens": 20,
+      "total_tokens": 41,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.2228268519958696,
+      "answer": "Onda che respira,\nschiuma bianca sul blu,\nil mare sogna.",
+      "finish_reason": "stop"
+    },
+    {
+      "id": "practical",
+      "category": "consiglio",
+      "prompt": "Suggerisci due modi semplici per ridurre gli sprechi d'acqua in casa.",
+      "status": "ok",
+      "elapsed_s": 23.549411545000112,
+      "prompt_tokens": 26,
+      "completion_tokens": 32,
+      "total_tokens": 58,
+      "cached_tokens": 0,
+      "end_to_end_completion_tps": 1.3588449944429322,
+      "answer": "Ecco due modi semplici ed efficaci per ridurre gli sprechi d'acqua in casa:\n\n**1. Installare riduttori di fl",
+      "finish_reason": "length"
+    }
+  ],
+  "correctness": {
+    "exact_match": true,
+    "differences": []
+  },
+  "comparison": {
+    "total_elapsed_s": {
+      "reference": 119.29614379499435,
+      "candidate": 166.12125706700135,
+      "change_rate": 0.39251154129905563
+    },
+    "prefill_seconds": {
+      "reference": 60.39,
+      "candidate": 85.857,
+      "change_rate": 0.42170889220069546
+    },
+    "decode_seconds": {
+      "reference": 58.822,
+      "candidate": 80.16199999999999,
+      "change_rate": 0.3627894325252455
+    },
+    "weighted_end_to_end_completion_tps": {
+      "reference": 1.5172326132439056,
+      "candidate": 1.0895655570857956,
+      "change_rate": -0.28187309739126964
+    },
+    "prefill_tokens_per_second": {
+      "reference": 4.437820831263454,
+      "candidate": 3.1214694200822297,
+      "change_rate": -0.2966211258255005
+    },
+    "decode_tokens_per_second": {
+      "reference": 3.077080004080106,
+      "candidate": 2.2579276964147605,
+      "change_rate": -0.2662109228811655
+    }
+  }
+}

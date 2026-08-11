@@ -1,0 +1,65 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 5080 Laptop GPU (sm_120) dev=0
+ds4: cuda SSD streaming total expert budget 8.00 GiB = 3.38 GiB prefill headroom + 4.62 GiB dynamic cache (701 experts, 6.75 MiB each)
+ds4: SSD streaming initial cuda model map restricted to token embedding (1 spans, 0.99 GiB tensor span)
+ds4: CUDA host registration skipped: out of memory
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.422s
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 1.70 GiB (raw 0.02 + compressed 1.68) + buffers 0.03 GiB + resident model 0.99 GiB + expert cache 4.62 GiB + prefill expert reserve 3.38 GiB = 10.71 GiB planned
+ds4: memory detail: ctx=131072 prefill_cap=128 raw_kv_rows=256 compressed_kv_rows=32770 backend=cuda
+0807 14:35:27 ds4-server: context buffers 1773.75 MiB (ctx=131072, backend=cuda, prefill_chunk=128, raw_kv_rows=256, compressed_kv_rows=32770)
+0807 14:35:27 ds4-server: listening on http://127.0.0.1:18080
+0807 14:35:27 ds4-server: chat ctx=0..21:21 prompt start
+ds4: DS4_CUDA_MMQ=0 - mmq prefill tier disabled
+ds4: CUDA layer expert cache allocated 4.62 GiB (701 experts across 43 layers)
+0807 14:35:36 ds4-server: chat ctx=0..21:21 prompt done 7.828s
+0807 14:35:39 ds4-server: chat ctx=21..32:11 gen=11 decoding chunk=3.47 t/s avg=3.47 t/s 3.167s
+0807 14:35:39 ds4-server: chat ctx=0..21:21 gen=11 finish=stop 10.998s
+0807 14:35:39 ds4-server: live kv cache miss live=32 prompt=20 common=2 reason=token-mismatch
+0807 14:35:39 ds4-server: chat ctx=0..20:20 prompt start
+0807 14:35:46 ds4-server: chat ctx=0..20:20 prompt done 6.067s
+0807 14:35:48 ds4-server: chat ctx=20..27:7 gen=7 decoding chunk=3.19 t/s avg=3.19 t/s 2.196s
+0807 14:35:48 ds4-server: chat ctx=0..20:20 gen=7 finish=stop 8.265s
+0807 14:35:48 ds4-server: live kv cache miss live=27 prompt=24 common=2 reason=token-mismatch
+0807 14:35:48 ds4-server: chat ctx=0..24:24 prompt start
+0807 14:35:52 ds4-server: chat ctx=0..24:24 prompt done 4.480s
+0807 14:35:55 ds4-server: chat ctx=24..32:8 gen=8 decoding chunk=2.83 t/s avg=2.83 t/s 2.829s
+0807 14:35:55 ds4-server: chat ctx=0..24:24 gen=8 finish=stop 7.312s
+0807 14:35:55 ds4-server: live kv cache miss live=32 prompt=42 common=2 reason=token-mismatch
+0807 14:35:55 ds4-server: chat ctx=0..42:42 prompt start
+0807 14:36:02 ds4-server: chat ctx=0..42:42 prompt done 6.817s
+0807 14:36:10 ds4-server: chat ctx=42..64:22 gen=22 decoding chunk=3.40 t/s avg=3.40 t/s 6.478s
+0807 14:36:10 ds4-server: chat ctx=0..42:42 gen=22 finish=stop 13.297s
+0807 14:36:10 ds4-server: live kv cache miss live=64 prompt=29 common=2 reason=token-mismatch
+0807 14:36:10 ds4-server: chat ctx=0..29:29 prompt start
+0807 14:36:15 ds4-server: chat ctx=0..29:29 prompt done 5.318s
+0807 14:36:25 ds4-server: chat ctx=29..61:32 gen=32 decoding chunk=3.30 t/s avg=3.30 t/s 9.692s
+0807 14:36:25 ds4-server: chat ctx=0..29:29 gen=32 finish=length 15.014s
+0807 14:36:25 ds4-server: live kv cache miss live=61 prompt=29 common=2 reason=token-mismatch
+0807 14:36:25 ds4-server: chat ctx=0..29:29 prompt start
+0807 14:36:29 ds4-server: chat ctx=0..29:29 prompt done 4.611s
+0807 14:36:39 ds4-server: chat ctx=29..61:32 gen=32 decoding chunk=3.33 t/s avg=3.33 t/s 9.615s
+0807 14:36:39 ds4-server: chat ctx=0..29:29 gen=32 finish=length 14.229s
+0807 14:36:39 ds4-server: live kv cache miss live=61 prompt=32 common=2 reason=token-mismatch
+0807 14:36:39 ds4-server: chat ctx=0..32:32 prompt start
+0807 14:36:45 ds4-server: chat ctx=0..32:32 prompt done 4.888s
+0807 14:36:47 ds4-server: chat ctx=32..40:8 gen=8 decoding chunk=3.41 t/s avg=3.41 t/s 2.348s
+0807 14:36:47 ds4-server: chat ctx=0..32:32 gen=8 finish=stop 7.240s
+0807 14:36:47 ds4-server: live kv cache miss live=40 prompt=24 common=2 reason=token-mismatch
+0807 14:36:47 ds4-server: chat ctx=0..24:24 prompt start
+0807 14:36:52 ds4-server: chat ctx=0..24:24 prompt done 4.771s
+0807 14:36:54 ds4-server: chat ctx=24..33:9 gen=9 decoding chunk=3.79 t/s avg=3.79 t/s 2.373s
+0807 14:36:54 ds4-server: chat ctx=0..24:24 gen=9 finish=stop 7.146s
+0807 14:36:54 ds4-server: live kv cache miss live=33 prompt=21 common=2 reason=token-mismatch
+0807 14:36:54 ds4-server: chat ctx=0..21:21 prompt start
+0807 14:36:59 ds4-server: chat ctx=0..21:21 prompt done 4.234s
+0807 14:37:04 ds4-server: chat ctx=21..41:20 gen=20 decoding chunk=3.94 t/s avg=3.94 t/s 5.070s
+0807 14:37:04 ds4-server: chat ctx=0..21:21 gen=20 finish=stop 9.309s
+0807 14:37:04 ds4-server: live kv cache miss live=41 prompt=26 common=2 reason=token-mismatch
+0807 14:37:04 ds4-server: chat ctx=0..26:26 prompt start
+0807 14:37:08 ds4-server: chat ctx=0..26:26 prompt done 4.701s
+0807 14:37:18 ds4-server: chat ctx=26..58:32 gen=32 decoding chunk=3.59 t/s avg=3.59 t/s 8.902s
+0807 14:37:18 ds4-server: chat ctx=0..26:26 gen=32 finish=length 13.606s
+0807 14:37:18 ds4-server: shutdown requested, draining requests

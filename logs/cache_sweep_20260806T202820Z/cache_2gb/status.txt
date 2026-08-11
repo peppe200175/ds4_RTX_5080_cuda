@@ -1,0 +1,1 @@
+startup_failed rc=1

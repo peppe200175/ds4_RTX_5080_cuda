@@ -1,0 +1,8 @@
+# DeepSeek V4 Flash 0731 layer-local prefill hotspots.
+# Format: LAYER EXPERT [EXPERT]
+# These six pairs were selected in all three recorded prefill workloads.
+7 233 141
+8 28
+26 191
+37 55
+40 104

@@ -1,0 +1,18 @@
+DS4 recovered CUDA version
+==========================
+
+Status: only locally approved interactive CUDA build
+Recovered CUDA source blob: 8738c02670b968a6a647c8980890746fe80edf4e
+DS4 binary SHA-256: 42eed1051a6c4279bbc06c47228465be3f7456ed84617234e6337d54fc3d0a11
+DS4-server binary SHA-256: d6a5ca209353bb65bbf0e87c521df3966b4b37d50708eef3a30e476ba4c5a15c
+Local preservation commit: a4a5994446926177b05c2fca9a70ce28dc56865d
+Local branch: local/ds4-cuda-definitive
+Local tag: ds4-cuda-definitive-20260806
+
+The native WSL interactive entry point is run_ds4_cuda_terminal.sh. It calls
+run_ds4_cuda.sh, which verifies both the normalized CUDA source blob and the
+exact ds4 executable before launch. Any different pull, rebuild, or experiment
+is refused until these approved hashes are deliberately updated.
+
+The model GGUF, generated logs, Docker artifacts, and repository history are
+not part of the executable identity and are not deleted by this guard.
