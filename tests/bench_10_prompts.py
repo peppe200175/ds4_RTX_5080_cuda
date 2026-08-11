@@ -92,18 +92,26 @@ def main() -> int:
     parser.add_argument("--url", default="http://127.0.0.1:18080")
     parser.add_argument("--model", default="deepseek-chat")
     parser.add_argument("--max-tokens", type=int, default=48)
+    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--repeat-input", type=int, default=1)
     parser.add_argument(
         "--output", default="logs/bench_10_prompts_results.json"
     )
     args = parser.parse_args()
+    if args.limit < 1 or args.limit > len(PROMPTS):
+        parser.error(f"--limit must be between 1 and {len(PROMPTS)}")
+    if args.repeat_input < 1:
+        parser.error("--repeat-input must be positive")
 
     endpoint = args.url.rstrip("/") + "/v1/chat/completions"
     results = []
+    prompts = PROMPTS[: args.limit]
 
-    for index, item in enumerate(PROMPTS, start=1):
+    for index, item in enumerate(prompts, start=1):
+        prompt = " ".join([item["prompt"]] * args.repeat_input)
         body = {
             "model": args.model,
-            "messages": [{"role": "user", "content": item["prompt"]}],
+            "messages": [{"role": "user", "content": prompt}],
             "max_tokens": args.max_tokens,
             "temperature": 0,
             "stream": False,
@@ -153,7 +161,7 @@ def main() -> int:
         results.append(result)
         if result["status"] == "ok":
             print(
-                f"[{index:02d}/10] {item['id']:<10} "
+                f"[{index:02d}/{len(prompts):02d}] {item['id']:<10} "
                 f"{result['prompt_tokens']:>3} in + "
                 f"{result['completion_tokens']:>3} out | "
                 f"{result['elapsed_s']:>7.2f}s | "
@@ -162,7 +170,7 @@ def main() -> int:
             )
         else:
             print(
-                f"[{index:02d}/10] {item['id']:<10} ERROR: {result['error']}",
+                f"[{index:02d}/{len(prompts):02d}] {item['id']:<10} ERROR: {result['error']}",
                 flush=True,
             )
 

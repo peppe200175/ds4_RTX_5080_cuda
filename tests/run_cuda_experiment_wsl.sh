@@ -13,6 +13,10 @@ model="${DS4_MODEL:-/home/peppe200175/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AP
 port="${DS4_BENCH_PORT:-18080}"
 max_tokens="${DS4_BENCH_MAX_TOKENS:-32}"
 cache_budget="${DS4_EXPERIMENT_CACHE_BUDGET:-10GB}"
+context_size="${DS4_EXPERIMENT_CONTEXT:-4096}"
+prefill_chunk="${DS4_EXPERIMENT_PREFILL_CHUNK:-128}"
+bench_limit="${DS4_BENCH_LIMIT:-10}"
+bench_repeat_input="${DS4_BENCH_REPEAT_INPUT:-1}"
 run_id="${DS4_EXPERIMENT_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 run_dir="$repo_dir/logs/cuda_experiments/${run_id}_${name}"
 server_log="$run_dir/server.log"
@@ -79,6 +83,10 @@ export DS4_LOCK_FILE="/tmp/ds4-cuda-experiment-${run_id}-${name}.lock"
     printf 'model_size=%s\n' "$(stat -c %s "$model")"
     printf 'max_tokens=%s\n' "$max_tokens"
     printf 'cache_budget=%s\n' "$cache_budget"
+    printf 'context_size=%s\n' "$context_size"
+    printf 'prefill_chunk=%s\n' "$prefill_chunk"
+    printf 'bench_limit=%s\n' "$bench_limit"
+    printf 'bench_repeat_input=%s\n' "$bench_repeat_input"
     printf 'max_gpu_temp_c=%s\n' "$max_gpu_temp"
     printf 'start_gpu_temp_c=%s\n' "$gpu_temp"
     env | LC_ALL=C sort | grep '^DS4_' || true
@@ -89,8 +97,8 @@ export DS4_LOCK_FILE="/tmp/ds4-cuda-experiment-${run_id}-${name}.lock"
     -m "$model" \
     --ssd-streaming \
     --ssd-streaming-cache-experts "$cache_budget" \
-    --prefill-chunk 128 \
-    --ctx 4096 \
+    --prefill-chunk "$prefill_chunk" \
+    --ctx "$context_size" \
     --tokens "$max_tokens" \
     --host 127.0.0.1 \
     --port "$port" \
@@ -144,6 +152,8 @@ thermal_sampler_pid=$!
 python3 "$script_dir/bench_10_prompts.py" \
     --url "http://127.0.0.1:${port}" \
     --max-tokens "$max_tokens" \
+    --limit "$bench_limit" \
+    --repeat-input "$bench_repeat_input" \
     --output "$result_file"
 
 kill "$thermal_sampler_pid" 2>/dev/null || true

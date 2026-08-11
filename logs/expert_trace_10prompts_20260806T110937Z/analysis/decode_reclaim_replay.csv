@@ -1,0 +1,5 @@
+reclaim_fraction,added_slots,decode_slot_budget,minimum_decode_slots_per_layer,maximum_decode_slots_per_layer,replayed_misses,predicted_misses_saved,predicted_disk_read_saved_gib,predicted_miss_reduction_rate
+0.0,0,1005,23,24,34567,0,0.0,0.0
+0.3333333333333333,171,1176,27,28,32896,1671,11.014892578125,0.04834090317354702
+0.6666666666666666,341,1346,31,32,31673,2894,19.07666015625,0.08372146845257038
+1.0,512,1517,35,36,30887,3680,24.2578125,0.10645991841930165

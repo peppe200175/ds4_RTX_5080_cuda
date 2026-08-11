@@ -15042,6 +15042,13 @@ typedef struct {
      * layer compression ratio instead of pessimistically using the ratio-4 cap
      * for every ratio-128 layer. */
     uint32_t layer_comp_cap[DS4_MAX_LAYER];
+    /* CUDA can reserve only the compressed rows that are currently useful
+     * and grow these tensors geometrically.  layer_comp_cap remains the
+     * logical context limit; layer_comp_alloc_cap is the physical allocation.
+     * The opt-in experiment keeps the legacy full allocation as the default. */
+    uint32_t layer_comp_alloc_cap[DS4_MAX_LAYER];
+    bool lazy_comp_cache;
+    bool managed_kv_cache;
     uint32_t attn_comp_stage_cap;
 
     /* Class P (per-layer work tensors). Each used tier has its
@@ -16502,6 +16509,38 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
     return metal_graph_alloc_kv_cache_tensor_on(managed, 0, bytes);
 }
 
+static bool metal_graph_cuda_lazy_comp_cache_enabled(void) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    return false;
+#else
+    const char *env = getenv("DS4_CUDA_LAZY_KV_CACHE");
+    if (!env || !env[0] || env[0] == '0' ||
+        strcmp(env, "off") == 0 || strcmp(env, "OFF") == 0 ||
+        strcmp(env, "false") == 0 || strcmp(env, "FALSE") == 0) {
+        return false;
+    }
+    return true;
+#endif
+}
+
+static uint32_t metal_graph_cuda_lazy_comp_initial_tokens(void) {
+    const uint32_t fallback = 4096u;
+    const char *env = getenv("DS4_CUDA_LAZY_KV_INITIAL_TOKENS");
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long parsed = strtoul(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || parsed == 0 ||
+        parsed > UINT32_MAX) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_LAZY_KV_INITIAL_TOKENS=%s; using %u\n",
+                env,
+                fallback);
+        return fallback;
+    }
+    return (uint32_t)parsed;
+}
+
 /* =========================================================================
  * Metal Diagnostic Dump Hooks.
  * =========================================================================
@@ -17301,18 +17340,38 @@ static bool metal_graph_alloc_raw_cap(
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
+    g->lazy_comp_cache = metal_graph_cuda_lazy_comp_cache_enabled();
+    uint32_t lazy_initial_tokens = g->lazy_comp_cache
+        ? metal_graph_cuda_lazy_comp_initial_tokens() : ctx_size;
+    if (lazy_initial_tokens > ctx_size) lazy_initial_tokens = ctx_size;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) {
             g->layer_comp_cap[il] = 0;
+            g->layer_comp_alloc_cap[il] = 0;
             continue;
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) {
             g->layer_comp_cap[il] = 0;
+            g->layer_comp_alloc_cap[il] = 0;
         } else {
             g->layer_comp_cap[il] = ctx_size / ratio + 2u;
             if (g->layer_comp_cap[il] < 2u) g->layer_comp_cap[il] = 2u;
+            g->layer_comp_alloc_cap[il] = g->layer_comp_cap[il];
+            if (g->lazy_comp_cache && lazy_initial_tokens < ctx_size) {
+                uint32_t initial_cap = lazy_initial_tokens / ratio + 2u;
+                if (initial_cap < 2u) initial_cap = 2u;
+                if (initial_cap < g->layer_comp_alloc_cap[il]) {
+                    g->layer_comp_alloc_cap[il] = initial_cap;
+                }
+            }
         }
+    }
+    if (g->lazy_comp_cache && lazy_initial_tokens < ctx_size) {
+        fprintf(stderr,
+                "ds4: CUDA lazy compressed KV enabled: initial_tokens=%u ctx=%u\n",
+                lazy_initial_tokens,
+                ctx_size);
     }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -17338,6 +17397,7 @@ static bool metal_graph_alloc_raw_cap(
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
     const bool managed_kv_cache =
         ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+    g->managed_kv_cache = managed_kv_cache;
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
@@ -17445,13 +17505,13 @@ static bool metal_graph_alloc_raw_cap(
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                     managed_kv_cache,
                     layer_tier,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
+                    (uint64_t)g->layer_comp_alloc_cap[il] * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             if (layer_tp_partner >= 0) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
                         layer_tp_partner,
-                        (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
+                        (uint64_t)g->layer_comp_alloc_cap[il] * DS4_N_HEAD_DIM *
                         (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             }
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
@@ -17489,7 +17549,7 @@ static bool metal_graph_alloc_raw_cap(
                 g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
                         layer_tier,
-                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                        (uint64_t)g->layer_comp_alloc_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 if (enable_frontier_snapshot) {
@@ -20392,6 +20452,117 @@ static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
            (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
 }
 
+static bool metal_graph_ensure_layer_comp_capacity(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       needed_rows) {
+    if (!g || il >= DS4_N_LAYER) return false;
+    const uint32_t logical_cap = g->layer_comp_cap[il];
+    uint32_t old_cap = g->layer_comp_alloc_cap[il];
+    if (needed_rows <= old_cap) return true;
+    if (!g->lazy_comp_cache || old_cap == 0 || needed_rows > logical_cap) {
+        return false;
+    }
+
+    uint32_t new_cap = old_cap;
+    while (new_cap < needed_rows) {
+        if (new_cap >= logical_cap || new_cap > logical_cap / 2u) {
+            new_cap = logical_cap;
+            break;
+        }
+        new_cap *= 2u;
+    }
+    if (new_cap < needed_rows) return false;
+
+    const int layer_tier = g->placement ? g->placement[il + 1u] : 0;
+    const int partner_tier = g->cuda_tp_attn_cache_dup
+        ? metal_graph_cuda_tp_partner_tier(layer_tier) : -1;
+    const uint64_t attn_row_bytes = metal_graph_attn_comp_cache_row_bytes();
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint64_t index_row_bytes =
+        (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+
+    ds4_gpu_tensor *new_attn = metal_graph_alloc_kv_cache_tensor_on(
+            g->managed_kv_cache,
+            layer_tier,
+            (uint64_t)new_cap * attn_row_bytes);
+    ds4_gpu_tensor *new_attn_tp = NULL;
+    ds4_gpu_tensor *new_index = NULL;
+    if (partner_tier >= 0) {
+        new_attn_tp = metal_graph_alloc_kv_cache_tensor_on(
+                g->managed_kv_cache,
+                partner_tier,
+                (uint64_t)new_cap * attn_row_bytes);
+    }
+    if (ratio == 4u) {
+        new_index = metal_graph_alloc_kv_cache_tensor_on(
+                g->managed_kv_cache,
+                layer_tier,
+                (uint64_t)new_cap * index_row_bytes);
+    }
+    if (!new_attn || (partner_tier >= 0 && !new_attn_tp) ||
+        (ratio == 4u && !new_index)) {
+        ds4_gpu_tensor_free(new_index);
+        ds4_gpu_tensor_free(new_attn_tp);
+        ds4_gpu_tensor_free(new_attn);
+        return false;
+    }
+
+    bool ok = true;
+    const uint32_t attn_rows = g->layer_n_comp[il] < old_cap
+        ? g->layer_n_comp[il] : old_cap;
+    const uint32_t index_rows = g->layer_n_index_comp[il] < old_cap
+        ? g->layer_n_index_comp[il] : old_cap;
+    if (attn_rows != 0) {
+        ok = ds4_gpu_tensor_copy(new_attn,
+                                 0,
+                                 g->layer_attn_comp_cache[il],
+                                 0,
+                                 (uint64_t)attn_rows * attn_row_bytes) != 0;
+    }
+    if (ok && new_attn_tp && attn_rows != 0) {
+        ok = ds4_gpu_tensor_copy(new_attn_tp,
+                                 0,
+                                 g->layer_attn_comp_cache_tp[il],
+                                 0,
+                                 (uint64_t)attn_rows * attn_row_bytes) != 0;
+    }
+    if (ok && new_index && index_rows != 0) {
+        ok = ds4_gpu_tensor_copy(new_index,
+                                 0,
+                                 g->layer_index_comp_cache[il],
+                                 0,
+                                 (uint64_t)index_rows * index_row_bytes) != 0;
+    }
+    if (!ok) {
+        ds4_gpu_tensor_free(new_index);
+        ds4_gpu_tensor_free(new_attn_tp);
+        ds4_gpu_tensor_free(new_attn);
+        return false;
+    }
+
+    /* Captured graph nodes contain the previous cache addresses. */
+    ds4_gpu_decode_graphs_invalidate();
+    ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+    g->layer_attn_comp_cache[il] = new_attn;
+    if (partner_tier >= 0) {
+        ds4_gpu_tensor_free(g->layer_attn_comp_cache_tp[il]);
+        g->layer_attn_comp_cache_tp[il] = new_attn_tp;
+    }
+    if (ratio == 4u) {
+        ds4_gpu_tensor_free(g->layer_index_comp_cache[il]);
+        g->layer_index_comp_cache[il] = new_index;
+    }
+    g->layer_comp_alloc_cap[il] = new_cap;
+    fprintf(stderr,
+            "ds4: CUDA lazy compressed KV grew layer=%u rows=%u->%u required=%u\n",
+            il,
+            old_cap,
+            new_cap,
+            needed_rows);
+    return true;
+}
+
 static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
     return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
 }
@@ -22417,6 +22588,24 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    if (compressed) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        uint32_t needed_rows = (pos + 1u) / ratio;
+        if (needed_rows < g->layer_n_comp[il]) {
+            needed_rows = g->layer_n_comp[il];
+        }
+        if (needed_rows < g->layer_n_index_comp[il]) {
+            needed_rows = g->layer_n_index_comp[il];
+        }
+        if (!metal_graph_ensure_layer_comp_capacity(g, il, needed_rows)) {
+            fprintf(stderr,
+                    "ds4: CUDA compressed KV allocation failed at layer %u "
+                    "for %u rows\n",
+                    il,
+                    needed_rows);
+            return false;
+        }
+    }
     const float freq_base = layer_rope_freq_base(il);
     const float freq_scale = layer_rope_freq_scale(il);
     const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
@@ -27811,6 +28000,23 @@ static bool metal_graph_encode_layer_attention_batch(
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
+    if (compressed) {
+        uint32_t needed_rows = (pos0 + n_tokens) / ratio;
+        if (needed_rows < g->layer_n_comp[il]) {
+            needed_rows = g->layer_n_comp[il];
+        }
+        if (needed_rows < g->layer_n_index_comp[il]) {
+            needed_rows = g->layer_n_index_comp[il];
+        }
+        if (!metal_graph_ensure_layer_comp_capacity(g, il, needed_rows)) {
+            fprintf(stderr,
+                    "ds4: CUDA compressed KV allocation failed at layer %u "
+                    "for %u rows\n",
+                    il,
+                    needed_rows);
+            return false;
+        }
+    }
     const bool zero_prefix = pos0 == 0;
     /* TP attention row split for large zero-prefix chunks: q_a and the KV
      * path stay full (both ranks need every row's KV, and the compressor/
@@ -50594,6 +50800,20 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         }
     }
 
+    for (uint32_t i = 0; i < n_layers; i++) {
+        const uint32_t il = layer_start + i;
+        uint32_t needed_rows = n_comp[i];
+        if (needed_rows < n_index_comp[i]) needed_rows = n_index_comp[i];
+        if (needed_rows != 0 &&
+            !metal_graph_ensure_layer_comp_capacity(g, il, needed_rows)) {
+            free(n_comp);
+            free(n_index_comp);
+            payload_set_err(err, errlen,
+                            "KV shard compressed cache could not be allocated");
+            return 1;
+        }
+    }
+
     if (ds4_gpu_synchronize() == 0) {
         free(n_comp);
         free(n_index_comp);
@@ -51771,6 +51991,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         if (n_index_comp[il] > saved_comp_cap || n_index_comp[il] > g->layer_comp_cap[il]) {
             token_vec_free(&new_checkpoint);
             payload_set_err(err, errlen, "KV checkpoint has invalid indexer row count");
+            return 1;
+        }
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint32_t needed_rows = n_comp[il];
+        if (needed_rows < n_index_comp[il]) needed_rows = n_index_comp[il];
+        if (needed_rows != 0 &&
+            !metal_graph_ensure_layer_comp_capacity(g, il, needed_rows)) {
+            token_vec_free(&new_checkpoint);
+            payload_set_err(err, errlen,
+                            "KV checkpoint compressed cache could not be allocated");
             return 1;
         }
     }

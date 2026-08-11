@@ -1,0 +1,3 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 5080 Laptop GPU (sm_120) dev=0
+ds4: --ssd-streaming-cache-experts byte budget 2.00 GiB is too small: routed prefill headroom needs 3.38 GiB

@@ -3,11 +3,11 @@ set -euo pipefail
 
 cd /mnt/c/Users/gmart/OneDrive/ds4
 
-# This launcher is intentionally pinned to the recovered CUDA build.  A pull,
-# rebuild, or accidental switch to another experimental backend must not be
-# started under the definitive profile without being verified first.
-readonly DS4_RECOVERED_CUDA_BLOB="8738c02670b968a6a647c8980890746fe80edf4e"
-readonly DS4_RECOVERED_BINARY_SHA256="42eed1051a6c4279bbc06c47228465be3f7456ed84617234e6337d54fc3d0a11"
+# This launcher is intentionally pinned to the measured definitive CUDA build.
+# A pull, rebuild, or accidental switch to another experimental backend must
+# not be started under this profile without being verified first.
+readonly DS4_RECOVERED_CUDA_BLOB="a7de59b363cc26ce533da7737a99f0b4b714e71f"
+readonly DS4_RECOVERED_BINARY_SHA256="789477561f110164da7f0a7377b89193966c4a5a1eb73f60a8b676f9c2514e09"
 
 if ! command -v git >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
     printf 'DS4 recovered guard: git and sha256sum are required.\n' >&2
@@ -76,6 +76,12 @@ unset DS4_EXPERT_TRACE_LOGITS
 export DS4_CUDA_WEIGHT_ARENA_CHUNK_MB="${DS4_CUDA_WEIGHT_ARENA_CHUNK_MB:-256}"
 unset DS4_CUDA_MODEL_COPY_CHUNK_MB
 
+# A 128K maximum no longer reserves every compressed KV row up front.  The
+# cache starts at a 4K physical allocation and grows losslessly by layer.  The
+# saved VRAM supports the measured 8 GB expert cache without changing tokens.
+export DS4_CUDA_LAZY_KV_CACHE="${DS4_CUDA_LAZY_KV_CACHE:-1}"
+export DS4_CUDA_LAZY_KV_INITIAL_TOKENS="${DS4_CUDA_LAZY_KV_INITIAL_TOKENS:-4096}"
+
 # Layer-pinned expert profiles remain opt-in: they reduce a few SSD misses but
 # did not improve median prefill/decode time on the measured prompt mix.
 # Example:
@@ -85,8 +91,8 @@ exec ./ds4 \
     --cuda \
     -m /home/peppe200175/ds4/ds4flash.gguf \
     --ssd-streaming \
-    --ssd-streaming-cache-experts 10GB \
-    --prefill-chunk 128 \
-    --ctx 4096 \
+    --ssd-streaming-cache-experts 8GB \
+    --prefill-chunk 1024 \
+    --ctx 131072 \
     --nothink \
     "$@"

@@ -14816,7 +14816,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
-    if (top_k == 512u && n_tokens >= 32u &&
+    if (top_k == 512u &&
+        (n_tokens == 1u || n_tokens >= 32u) &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
         indexer_topk_stream512_kernel<<<n_tokens, 512>>>(
