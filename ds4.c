@@ -21950,6 +21950,8 @@ typedef struct metal_graph_selected_async_load {
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     uint32_t                  n_tokens;
+    double                    queued_at;
+    double                    completed_at;
     int32_t                  *batch_selected_ids;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
 } metal_graph_selected_async_load;
@@ -21965,6 +21967,9 @@ static bool g_metal_graph_selected_async_load_thread_started = false;
 static bool g_metal_graph_selected_async_load_has_job = false;
 static bool g_metal_graph_selected_async_load_done = false;
 static metal_graph_selected_async_load g_metal_graph_selected_async_load_job;
+static uint64_t g_selected_async_jobs;
+static uint64_t g_selected_async_queue_contentions;
+static double g_selected_async_finish_wait_ms;
 
 static void metal_graph_selected_async_load_run(
         metal_graph_selected_async_load *job) {
@@ -22053,6 +22058,7 @@ static void *metal_graph_selected_async_load_worker_main(void *arg) {
         pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
 
         metal_graph_selected_async_load_run(&job);
+        job.completed_at = now_sec();
 
         pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
         g_metal_graph_selected_async_load_job = job;
@@ -22105,10 +22111,12 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     job->event_value = event_value;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
+    job->queued_at = now_sec();
 
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
     if (g_metal_graph_selected_async_load_has_job ||
         g_metal_graph_selected_async_load_done) {
+        g_selected_async_queue_contentions++;
         pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
         return false;
     }
@@ -22118,6 +22126,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     pthread_cond_signal(&g_metal_graph_selected_async_load_cond);
     pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
     job->active = true;
+    g_selected_async_jobs++;
     return true;
 }
 
@@ -22170,10 +22179,12 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_batch(
     job->event_value = event_value;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
+    job->queued_at = now_sec();
 
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
     if (g_metal_graph_selected_async_load_has_job ||
         g_metal_graph_selected_async_load_done) {
+        g_selected_async_queue_contentions++;
         pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
         free(job->batch_selected_ids);
         job->batch_selected_ids = NULL;
@@ -22185,12 +22196,14 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_batch(
     pthread_cond_signal(&g_metal_graph_selected_async_load_cond);
     pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
     job->active = true;
+    g_selected_async_jobs++;
     return true;
 }
 
 static bool metal_graph_selected_async_load_finish(
         metal_graph_selected_async_load *job) {
     if (!job || !job->active) return false;
+    const double wait_begin = now_sec();
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
     while (!g_metal_graph_selected_async_load_done) {
         pthread_cond_wait(&g_metal_graph_selected_async_load_done_cond,
@@ -22199,11 +22212,31 @@ static bool metal_graph_selected_async_load_finish(
     *job = g_metal_graph_selected_async_load_job;
     g_metal_graph_selected_async_load_done = false;
     pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
+    const double wait_ms = (now_sec() - wait_begin) * 1000.0;
+    g_selected_async_finish_wait_ms += wait_ms;
     job->active = false;
     const bool ok = job->ok &&
         (job->n_tokens > 0 ||
          ds4_gpu_routed_moe_set_selected_override(job->selected_ids,
                                                   DS4_N_EXPERT_USED) != 0);
+    if (getenv("DS4_CUDA_PREFETCH_TELEMETRY") &&
+        (g_selected_async_jobs == 1u ||
+         g_selected_async_jobs % 100u == 0u)) {
+        const uint64_t requested = job->n_tokens > 0 ?
+            (uint64_t)job->n_tokens * DS4_N_EXPERT_USED :
+            DS4_N_EXPERT_USED;
+        fprintf(stderr,
+                "ds4: CUDA prefetch telemetry layer=%u requested_slots=%" PRIu64
+                " demand_prefetch=true wasted_slots=0 queue_contentions=%" PRIu64
+                " finish_wait_ms=%.3f total_jobs=%" PRIu64
+                " total_finish_wait_ms=%.3f service_ms=%.3f ok=%s\n",
+                job->il, requested, g_selected_async_queue_contentions,
+                wait_ms, g_selected_async_jobs,
+                g_selected_async_finish_wait_ms,
+                job->completed_at > job->queued_at ?
+                    (job->completed_at - job->queued_at) * 1000.0 : 0.0,
+                ok ? "true" : "false");
+    }
     return ok;
 }
 
@@ -48376,7 +48409,7 @@ static int generate_metal_graph_raw_swa(
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
 #if !defined(DS4_ROCM_BUILD) && !defined(__APPLE__)
-    if (ssd_streaming) ds4_gpu_stream_expert_cache_prompt_begin();
+    if (ssd_streaming) ds4_gpu_stream_expert_cache_prompt_begin(0, 0);
 #endif
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
@@ -49298,13 +49331,44 @@ static void ds4_expert_trace_begin_prompt(
 }
 #endif
 
-static void ds4_prompt_expert_cache_begin(ds4_engine *e) {
+static uint64_t ds4_prefix_expert_cache_key(
+        const ds4_session *s, const ds4_tokens *prompt, uint32_t *cached_tokens) {
+    if (cached_tokens) *cached_tokens = 0;
+    if (!s || !prompt || !s->checkpoint_valid || s->checkpoint.len <= 0 ||
+        s->checkpoint.len >= prompt->len ||
+        !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+        return 0;
+    }
+    /* FNV-1a over exact token ids. The token count is folded in so this names
+     * the reusable inference frontier, not merely a byte prefix collision. */
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (int i = 0; i < s->checkpoint.len; i++) {
+        uint32_t token = (uint32_t)s->checkpoint.v[i];
+        for (unsigned b = 0; b < sizeof(token); b++) {
+            hash ^= (uint8_t)(token >> (b * 8u));
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+    hash ^= (uint32_t)s->checkpoint.len;
+    hash *= UINT64_C(1099511628211);
+    if (hash == 0) hash = 1;
+    if (cached_tokens) *cached_tokens = (uint32_t)s->checkpoint.len;
+    return hash;
+}
+
+static void ds4_prompt_expert_cache_begin(
+        ds4_session *s, const ds4_tokens *prompt) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    ds4_engine *e = s ? s->engine : NULL;
     if (e && e->backend == DS4_BACKEND_CUDA && e->ssd_streaming) {
-        ds4_gpu_stream_expert_cache_prompt_begin();
+        uint32_t cached_tokens = 0;
+        const uint64_t key = ds4_prefix_expert_cache_key(
+            s, prompt, &cached_tokens);
+        ds4_gpu_stream_expert_cache_prompt_begin(key, cached_tokens);
     }
 #else
-    (void)e;
+    (void)s;
+    (void)prompt;
 #endif
 }
 
@@ -59850,7 +59914,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
     ds4_expert_trace_begin_prompt(s, prompt);
-    ds4_prompt_expert_cache_begin(s->engine);
+    ds4_prompt_expert_cache_begin(s, prompt);
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         return ds4_dist_session_sync(s->distributed,
@@ -63037,12 +63101,47 @@ static bool metal_graph_session_batch_moe_supported(
         ds4_decode_item *items,
         int count,
         const ds4_weights *weights) {
-    if (!items || count < 3 || !weights || DS4_N_EXPERT_USED != 6u ||
+    if (!items || count < 2 || !weights || DS4_N_EXPERT_USED != 6u ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL) {
         return false;
     }
 
     ds4_gpu_graph *first = &items[0].session->graph;
+    const char *ssd_union = getenv("DS4_CUDA_SESSION_BATCH_SSD_UNION");
+    if (ssd_union && ssd_union[0] && strcmp(ssd_union, "0") != 0 &&
+        first->ssd_streaming && !first->placement && !first->quality &&
+        (uint32_t)count <= first->prefill_cap) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *layer = &weights->layer[il];
+            const uint32_t gate_type = layer->ffn_gate_exps ?
+                layer->ffn_gate_exps->type : UINT32_MAX;
+            const uint32_t down_type = layer->ffn_down_exps ?
+                layer->ffn_down_exps->type : UINT32_MAX;
+            const bool routed_type_ok =
+                (gate_type == 12u && down_type == 12u) ||
+                (gate_type == 16u && down_type == 10u) ||
+                (gate_type == 39u && down_type == 39u);
+            if (!routed_type_ok ||
+                !first->batch_ffn_norm_by_tier[0] ||
+                !first->batch_router_selected_by_tier[0] ||
+                !first->batch_router_weights_by_tier[0] ||
+                !first->batch_routed_gate_by_tier[0] ||
+                !first->batch_routed_up_by_tier[0] ||
+                !first->batch_routed_mid_by_tier[0] ||
+                !first->batch_routed_down_by_tier[0] ||
+                !first->batch_routed_out_by_tier[0]) {
+                return false;
+            }
+        }
+        for (int i = 1; i < count; i++) {
+            ds4_gpu_graph *g = &items[i].session->graph;
+            if (!g->ssd_streaming || g->placement || g->quality ||
+                (uint32_t)count > g->prefill_cap) {
+                return false;
+            }
+        }
+        return true;
+    }
     if (!first->placement || !first->cuda_tp_decode || !first->cuda_tp_ep ||
         first->quality || (uint32_t)count > first->prefill_cap) {
         return false;
@@ -64322,7 +64421,7 @@ static bool metal_graph_encode_ffn_pre_session_batch(
  * gather only normalized rows and routing metadata, execute the existing
  * expert-sorted multi-row kernels on both EP owners, then reduce each row in
  * the exact decode slot grouping before scattering it back. */
-static bool metal_graph_encode_routed_session_batch(
+static bool metal_graph_encode_routed_session_batch_tp(
         ds4_decode_item *items,
         int count,
         const ds4_model *model,
@@ -64548,7 +64647,249 @@ static bool metal_graph_encode_routed_session_batch(
                     &out_row, out_stride) != 0;
         }
     }
+    if (ok && getenv("DS4_CUDA_SESSION_BATCH_PROFILE")) {
+        static uint64_t grouped_dispatches = 0;
+        static uint64_t grouped_rows = 0;
+        grouped_dispatches++;
+        grouped_rows += (uint64_t)count;
+        fprintf(stderr,
+                "ds4: CUDA session expert union layer=%u sessions=%d "
+                "dispatches=1 owner_dispatches=2 storage_loads=0 "
+                "resident_tp=true cumulative_dispatches=%" PRIu64
+                " cumulative_rows=%" PRIu64 "\n",
+                il, count, grouped_dispatches, grouped_rows);
+    }
     return ok;
+}
+
+/* Single-GPU SSD server batches share one selected-expert transaction.  The
+ * union is formed by the CUDA selected cache from all session rows, so a hot
+ * expert is read at most once for the layer and the compact table feeds one
+ * multi-row routed kernel. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static bool metal_graph_encode_routed_session_batch_ssd(
+        ds4_decode_item *items,
+        int count,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t row_base,
+        bool gather_rows,
+        bool scatter_rows) {
+    if (!items || count < 2 || !model || !layer ||
+        DS4_N_EXPERT_USED == 0u) {
+        return false;
+    }
+    ds4_gpu_graph *g = &items[0].session->graph;
+    if (!g->ssd_streaming || g->placement || g->active_tier != 0 ||
+        (uint64_t)row_base + (uint32_t)count > g->prefill_cap) {
+        return false;
+    }
+
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    const uint64_t norm_bytes =
+        (uint64_t)count * DS4_N_EMBD * sizeof(float);
+    const uint64_t selected_bytes =
+        (uint64_t)count * DS4_N_EXPERT_USED * sizeof(int32_t);
+    const uint64_t weights_bytes =
+        (uint64_t)count * DS4_N_EXPERT_USED * sizeof(float);
+    const uint64_t output_bytes =
+        (uint64_t)count * routed_out_dim * sizeof(float);
+    const uint64_t norm_offset =
+        (uint64_t)row_base * DS4_N_EMBD * sizeof(float);
+    const uint64_t selected_offset =
+        (uint64_t)row_base * DS4_N_EXPERT_USED * sizeof(int32_t);
+    const uint64_t weights_offset =
+        (uint64_t)row_base * DS4_N_EXPERT_USED * sizeof(float);
+    const uint64_t output_offset =
+        (uint64_t)row_base * routed_out_dim * sizeof(float);
+
+    ds4_gpu_tensor norm, selected, weights, out;
+    bool ok =
+        metal_graph_borrow_tensor_view(
+                &norm, metal_graph_batch_ffn_norm(g),
+                norm_offset, norm_bytes) &&
+        metal_graph_borrow_tensor_view(
+                &selected, metal_graph_batch_router_selected(g),
+                selected_offset, selected_bytes) &&
+        metal_graph_borrow_tensor_view(
+                &weights, metal_graph_batch_router_weights(g),
+                weights_offset, weights_bytes) &&
+        metal_graph_borrow_tensor_view(
+                &out, metal_graph_batch_routed_out(g),
+                output_offset, output_bytes);
+
+    for (int i = 0; gather_rows && ok && i < count; i++) {
+        ds4_gpu_graph *src = &items[i].session->graph;
+        ds4_gpu_tensor norm_row, selected_row, weights_row;
+        ok = src->ssd_streaming && !src->placement && src->active_tier == 0 &&
+             metal_graph_borrow_tensor_view(
+                     &norm_row, &norm,
+                     (uint64_t)i * DS4_N_EMBD * sizeof(float),
+                     (uint64_t)DS4_N_EMBD * sizeof(float)) &&
+             metal_graph_borrow_tensor_view(
+                     &selected_row, &selected,
+                     (uint64_t)i * DS4_N_EXPERT_USED * sizeof(int32_t),
+                     (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) &&
+             metal_graph_borrow_tensor_view(
+                     &weights_row, &weights,
+                     (uint64_t)i * DS4_N_EXPERT_USED * sizeof(float),
+                     (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        if (ok) {
+            ok = ds4_gpu_tensor_copy_xdev3_default_dst(
+                    &norm_row, metal_graph_ffn_norm(src), norm_row.bytes,
+                    &selected_row, metal_graph_router_selected(src),
+                    selected_row.bytes,
+                    &weights_row, metal_graph_router_weights(src),
+                    weights_row.bytes) != 0;
+        }
+    }
+
+    int32_t *selected_ids = NULL;
+    ds4_gpu_stream_expert_cache_snapshot before = {0};
+    ds4_gpu_stream_expert_cache_snapshot after = {0};
+    if (ok) {
+        selected_ids = malloc((size_t)selected_bytes);
+        ok = selected_ids != NULL &&
+             ds4_gpu_tensor_read(
+                     &selected, 0, selected_ids, selected_bytes) != 0;
+    }
+    if (ok) {
+        (void)ds4_gpu_stream_expert_cache_get_snapshot(&before);
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(
+                    model, layer, il, gate_expert_bytes, down_expert_bytes);
+        ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                &table, selected_ids, (uint32_t)count,
+                DS4_N_EXPERT_USED) != 0;
+        (void)ds4_gpu_stream_expert_cache_get_snapshot(&after);
+    }
+    free(selected_ids);
+
+    /* Preserve the established one-row decode arithmetic while every row
+     * consumes the same compact union table. This still removes duplicate SSD
+     * reads; a future grouped kernel may replace the row loop only after the
+     * full-logit oracle proves it exact for heterogeneous rows. */
+    for (int i = 0; ok && i < count; i++) {
+        const uint64_t assignment =
+            (uint64_t)i * DS4_N_EXPERT_USED;
+        ds4_gpu_tensor norm_row, selected_row, weights_row, out_row;
+        ds4_gpu_tensor gate_row, up_row, mid_row, down_row;
+        ok = metal_graph_borrow_tensor_view(
+                     &norm_row, &norm,
+                     (uint64_t)i * DS4_N_EMBD * sizeof(float),
+                     (uint64_t)DS4_N_EMBD * sizeof(float)) &&
+             metal_graph_borrow_tensor_view(
+                     &selected_row, &selected,
+                     assignment * sizeof(int32_t),
+                     (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) &&
+             metal_graph_borrow_tensor_view(
+                     &weights_row, &weights,
+                     assignment * sizeof(float),
+                     (uint64_t)DS4_N_EXPERT_USED * sizeof(float)) &&
+             metal_graph_borrow_tensor_view(
+                     &out_row, &out,
+                     (uint64_t)i * routed_out_dim * sizeof(float),
+                     routed_out_dim * sizeof(float)) &&
+             metal_graph_borrow_tensor_view(
+                     &gate_row, metal_graph_batch_routed_gate(g),
+                     assignment * down_in_dim * sizeof(float),
+                     (uint64_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(float)) &&
+             metal_graph_borrow_tensor_view(
+                     &up_row, metal_graph_batch_routed_up(g),
+                     assignment * down_in_dim * sizeof(float),
+                     (uint64_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(float)) &&
+             metal_graph_borrow_tensor_view(
+                     &mid_row, metal_graph_batch_routed_mid(g),
+                     assignment * down_in_dim * sizeof(float),
+                     (uint64_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(float)) &&
+             metal_graph_borrow_tensor_view(
+                     &down_row, metal_graph_batch_routed_down(g),
+                     assignment * routed_out_dim * sizeof(float),
+                     (uint64_t)DS4_N_EXPERT_USED * routed_out_dim * sizeof(float)) &&
+             ds4_gpu_stream_expert_cache_set_selected_slot_offset(
+                     (uint32_t)assignment) != 0;
+        if (ok) {
+            ok = ds4_gpu_routed_moe_one_tensor(
+                    &out_row, &gate_row, &up_row, &mid_row, &down_row,
+                    model->map, model->size,
+                    layer->ffn_gate_exps->abs_offset,
+                    layer->ffn_up_exps->abs_offset,
+                    layer->ffn_down_exps->abs_offset,
+                    layer->ffn_gate_exps->type,
+                    layer->ffn_down_exps->type,
+                    gate_expert_bytes, gate_row_bytes,
+                    down_expert_bytes, down_row_bytes,
+                    (uint32_t)expert_in_dim,
+                    (uint32_t)down_in_dim,
+                    (uint32_t)routed_out_dim,
+                    &selected_row, &weights_row,
+                    DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                    DS4_SWIGLU_CLAMP_EXP, &norm_row, NULL, il, false) != 0;
+        }
+    }
+    if (!ds4_gpu_stream_expert_cache_set_selected_slot_offset(0u)) ok = false;
+    for (int i = 0; ok && scatter_rows && i < count; i++) {
+        ds4_gpu_tensor out_row;
+        ok = metal_graph_borrow_tensor_view(
+                &out_row, &out,
+                (uint64_t)i * routed_out_dim * sizeof(float),
+                routed_out_dim * sizeof(float));
+        if (ok) {
+            ok = ds4_gpu_tensor_copy_xdev_default(
+                    metal_graph_routed_out(&items[i].session->graph),
+                    &out_row, out_row.bytes) != 0;
+        }
+    }
+    if (ok && getenv("DS4_CUDA_SESSION_BATCH_PROFILE")) {
+        fprintf(stderr,
+                "ds4: CUDA SSD session expert union layer=%u sessions=%d "
+                "requested_slots=%u unique_experts=%u model_read_bytes=%" PRIu64
+                " cache_hit_bytes=%" PRIu64 " load_transactions=1 "
+                "execution_rows=%d\n",
+                il, count, (uint32_t)count * DS4_N_EXPERT_USED,
+                after.compact_count,
+                after.persistent_model_bytes_read >=
+                        before.persistent_model_bytes_read ?
+                    after.persistent_model_bytes_read -
+                        before.persistent_model_bytes_read : 0,
+                after.persistent_cache_hit_bytes >=
+                        before.persistent_cache_hit_bytes ?
+                    after.persistent_cache_hit_bytes -
+                        before.persistent_cache_hit_bytes : 0,
+                count);
+    }
+    return ok;
+}
+#endif
+
+static bool metal_graph_encode_routed_session_batch(
+        ds4_decode_item *items,
+        int count,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t row_base,
+        bool gather_rows,
+        bool scatter_rows) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (items && count > 0 && items[0].session &&
+        items[0].session->graph.ssd_streaming) {
+        return metal_graph_encode_routed_session_batch_ssd(
+                items, count, model, layer, il, row_base,
+                gather_rows, scatter_rows);
+    }
+#endif
+    return metal_graph_encode_routed_session_batch_tp(
+            items, count, model, layer, il, row_base,
+            gather_rows, scatter_rows);
 }
 
 /* Run one owned-expert dispatch over prefill rows followed by exact decode
@@ -64963,13 +65304,14 @@ static bool metal_graph_encode_session_pipeline_batch(
         const ds4_weights *weights) {
     if (!items || count <= 0 || !model || !weights) return false;
     ds4_gpu_graph *first = &items[0].session->graph;
-    if (!first->placement) return false;
+    if (!first->placement && !first->ssd_streaming) return false;
 
     const bool group_routed_moe =
         metal_graph_tp_env_flag("DS4_CUDA_SESSION_BATCH_MOE", true) &&
         metal_graph_session_batch_moe_supported(items, count, weights);
     const bool group_shared_ffn =
         group_routed_moe &&
+        !first->ssd_streaming &&
         metal_graph_tp_env_flag("DS4_CUDA_SESSION_BATCH_SHARED", true) &&
         metal_graph_session_batch_shared_supported(items, count, weights);
     const bool group_ffn_pre =
@@ -65012,7 +65354,9 @@ static bool metal_graph_encode_session_pipeline_batch(
     for (int i = 0; ok && i < count; i++) {
         ds4_session *s = items[i].session;
         ds4_gpu_graph *g = &s->graph;
-        if (!g->placement || g->raw_cap == 0) return false;
+        if ((!g->placement && !g->ssd_streaming) || g->raw_cap == 0) {
+            return false;
+        }
         metal_graph_dspark_capture_begin(g);
         if (!metal_graph_set_active_tier_decode(g, g->emb_tier)) return false;
         ok = ds4_gpu_embed_token_hc_tensor(
@@ -65028,10 +65372,12 @@ static bool metal_graph_encode_session_pipeline_batch(
 
     uint32_t stage_begin = 0;
     while (ok && stage_begin < DS4_N_LAYER) {
-        const int stage_tier = first->placement[stage_begin + 1u];
+        const int stage_tier = first->placement ?
+            first->placement[stage_begin + 1u] : 0;
         uint32_t stage_end = stage_begin + 1u;
         while (stage_end < DS4_N_LAYER &&
-               first->placement[stage_end + 1u] == stage_tier) {
+               (!first->placement ||
+                first->placement[stage_end + 1u] == stage_tier)) {
             stage_end++;
         }
 
@@ -65055,7 +65401,8 @@ static bool metal_graph_encode_session_pipeline_batch(
                     const uint32_t raw_row = pos % g->raw_cap;
                     const uint32_t n_raw =
                         metal_graph_raw_span_for_batch(g, pos, 1);
-                    if (g->placement[il + 1u] != stage_tier) {
+                    if (g->placement &&
+                        g->placement[il + 1u] != stage_tier) {
                         ok = false;
                         break;
                     }
@@ -65183,12 +65530,14 @@ static bool metal_graph_encode_session_pipeline_batch(
                 const uint32_t pos = (uint32_t)s->checkpoint.len;
                 const uint32_t raw_row = pos % g->raw_cap;
                 const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
-                if (g->placement[stage_begin + 1u] != stage_tier) {
+                if (g->placement &&
+                    g->placement[stage_begin + 1u] != stage_tier) {
                     ok = false;
                     break;
                 }
                 for (uint32_t il = stage_begin; ok && il < stage_end; il++) {
-                    if (g->placement[il + 1u] != stage_tier) {
+                    if (g->placement &&
+                        g->placement[il + 1u] != stage_tier) {
                         ok = false;
                         break;
                     }
@@ -65661,7 +66010,8 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
         const char *interleave = getenv("DS4_CUDA_SESSION_BATCH_INTERLEAVE");
         const bool use_pipeline = !interleave || !interleave[0] ||
                                   strcmp(interleave, "0") != 0;
-        if (ok && use_pipeline && first->graph.placement) {
+        if (ok && use_pipeline &&
+            (first->graph.placement || first->graph.ssd_streaming)) {
             ok = metal_graph_encode_session_pipeline_batch(
                     items, count, &e->model, &e->weights);
         } else {

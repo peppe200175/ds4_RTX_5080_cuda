@@ -384,8 +384,66 @@ state:
 ./download_model.sh glm-antirez-q2
 make strix-halo
 ./ds4 --rocm -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
-  --ssd-streaming --ctx 4096
+    --ssd-streaming --ctx 4096
 ```
+
+CUDA SSD-streaming machines can inspect an explainable hardware-derived plan,
+or run a correctness-gated five-profile sweep using the standard ten-sentence
+benchmark:
+
+```sh
+python3 tools/tune_cuda_streaming.py plan --model ./ds4flash.gguf --ctx 131072
+python3 tools/tune_cuda_streaming.py tune --model ./ds4flash.gguf --ctx 131072
+```
+
+The tuner changes one variable at a time (arena size, prefill chunk, expert
+budget, and reader count), rejects candidates whose answers differ from the
+baseline, saves every raw run under `logs/cuda_experiments/`, and writes the
+winning command plus its hardware explanation to `ds4_cuda_tuning.json`.
+On a multi-node NUMA host, CUDA discovers the GPU PCI device's NUMA node and
+pins only the persistent SSD reader workers to that node's allowed CPUs.
+Compute threads and general allocations remain under the caller's scheduler;
+single-node machines are unchanged. Set
+`DS4_CUDA_STREAMING_NUMA_AFFINITY=0` to disable this selective affinity.
+The resident expert cache is the dynamic promotion tier: repeated routed
+experts are promoted from SSD staging into VRAM with frequency/LRU admission,
+while cold residents are demoted by eviction. Cache snapshots expose hits,
+insertions, and evictions so this behavior is measurable rather than inferred.
+`DS4_CUDA_DYNAMIC_TIER_PROMOTION=0` supplies a static first-fill control for
+experiments; the automatic tuner and measured launcher keep promotion enabled.
+
+If the GGUF is mirrored byte-for-byte on a second physical SSD, CUDA can split
+model reads deterministically into 4 MiB logical stripes:
+
+```sh
+DS4_CUDA_MODEL_REPLICA_PATH=/mnt/ssd2/ds4flash.gguf ./run_ds4_cuda.sh
+```
+
+The replica must have exactly the same file size. With
+`DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`, shutdown reports bytes served by each path;
+this makes it possible to verify balancing before benchmarking. Do not use two
+paths backed by the same device, because that adds queue pressure without more
+bandwidth.
+
+`DS4_CUDA_PREFETCH_TELEMETRY=1` periodically reports async demand-load service
+time, caller wait time, queue-contention count, and wasted slots. Current
+demand loads have zero speculative waste by construction. Predictive prefetch
+remains disabled: the measured overlap experiment still left roughly 9 ms of
+caller wait per routed layer and did not improve the live short-prompt run.
+Enable `DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP=1` only for controlled A/B
+tests, not as a default.
+
+For tensor-parallel servers, `DS4_CUDA_SESSION_BATCH_PROFILE=1` proves the
+routed part of each layer is issued as one unioned row dispatch (two owner
+kernels and no storage loads) rather than one dispatch per session.
+Single-GPU SSD batches also have an experimental union loader, enabled with
+`DS4_CUDA_SESSION_BATCH_SSD_UNION=1`; the same profile reports requested slots,
+unique experts, storage bytes, and one load transaction per layer. It remains
+off by default: on the measured RTX 5080, two rows were about 0.8% slower and
+four rows were about 32.8% slower than independent loading despite successful
+deduplication. Identical prompts passed the strict full-logit oracle; for
+heterogeneous prompts both the legacy and union paths had run-to-run float-logit
+variation but retained the same argmax hash.
 
 ## Distributed inference with pipeline parallelism
 

@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sched.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -98,8 +99,12 @@ static int g_model_hmm_direct;
 static int g_model_fd = -1;
 static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
+static int g_model_replica_fd = -1;
+static int g_model_replica_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
+static volatile uint64_t g_model_primary_read_bytes;
+static volatile uint64_t g_model_replica_read_bytes;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
@@ -278,6 +283,7 @@ typedef struct {
     uint64_t *session_frequency;
     ds4_prompt_cache_config prompt_config;
     int      prompt_policy_enabled;
+    int      dynamic_tier_promotion_enabled;
     uint32_t prompt_policy_phase;
     uint64_t prompt_generation;
     uint64_t decode_token;
@@ -304,6 +310,68 @@ static uint64_t g_stream_layer_cache_expert_bytes;
 static int g_stream_layer_cache_allocation_failed;
 static uint32_t g_stream_prompt_lifecycle_phase = DS4_PROMPT_CACHE_PHASE_IDLE;
 static uint64_t g_stream_prompt_lifecycle_generation;
+
+enum { DS4_PREFIX_PROFILE_MAX = 16 };
+typedef struct {
+    uint64_t key;
+    uint64_t last_used;
+    uint32_t observations;
+    uint16_t *frequency;
+} cuda_prefix_expert_profile;
+
+static cuda_prefix_expert_profile g_prefix_profiles[DS4_PREFIX_PROFILE_MAX];
+static cuda_prefix_expert_profile *g_prefix_active;
+static uint64_t g_prefix_profile_clock;
+static uint32_t g_prefix_cached_tokens;
+static uint64_t g_prefix_profile_hits;
+static uint64_t g_prefix_profile_admissions;
+static uint64_t g_prefix_profile_rejections;
+
+static int cuda_env_flag_enabled(const char *name, int fallback);
+
+static int cuda_prefix_profile_enabled(void) {
+    return cuda_env_flag_enabled("DS4_CUDA_PREFIX_EXPERT_CACHE", 0);
+}
+
+static size_t cuda_prefix_profile_cells(void) {
+    if (!g_stream_layer_cache.valid) return 0;
+    return (size_t)g_stream_layer_cache.layer_count *
+           g_stream_layer_cache.n_total_expert;
+}
+
+static cuda_prefix_expert_profile *cuda_prefix_profile_select(uint64_t key) {
+    g_prefix_active = NULL;
+    g_prefix_cached_tokens = 0;
+    if (!key || !cuda_prefix_profile_enabled()) return NULL;
+    cuda_prefix_expert_profile *empty = NULL;
+    cuda_prefix_expert_profile *oldest = &g_prefix_profiles[0];
+    for (unsigned i = 0; i < DS4_PREFIX_PROFILE_MAX; i++) {
+        cuda_prefix_expert_profile *p = &g_prefix_profiles[i];
+        if (p->key == key) {
+            p->last_used = ++g_prefix_profile_clock;
+            return g_prefix_active = p;
+        }
+        if (!p->key && !empty) empty = p;
+        if (p->last_used < oldest->last_used) oldest = p;
+    }
+    cuda_prefix_expert_profile *p = empty ? empty : oldest;
+    free(p->frequency);
+    memset(p, 0, sizeof(*p));
+    const size_t cells = cuda_prefix_profile_cells();
+    if (cells) p->frequency = (uint16_t *)calloc(cells, sizeof(uint16_t));
+    if (cells && !p->frequency) return NULL;
+    p->key = key;
+    p->last_used = ++g_prefix_profile_clock;
+    return g_prefix_active = p;
+}
+
+static uint16_t cuda_prefix_profile_frequency(uint32_t layer, uint32_t expert) {
+    if (!g_prefix_active || !g_prefix_active->frequency ||
+        layer >= g_stream_layer_cache.layer_count ||
+        expert >= g_stream_layer_cache.n_total_expert) return 0;
+    return g_prefix_active->frequency[
+        (size_t)layer * g_stream_layer_cache.n_total_expert + expert];
+}
 
 static void cuda_stream_layer_cache_release(void) {
     const int tier = g_stream_layer_cache.logical_tier;
@@ -2288,8 +2356,16 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                                  uint64_t offset, uint64_t bytes,
                                  const char **payload) {
     *payload = (const char *)stage;
+    /* A replica is a byte-identical copy on a second filesystem/device.  Map
+     * fixed 4 MiB logical stripes to it so the result is independent of reader
+     * scheduling and repeatable across runs. */
+    const int use_replica = g_model_replica_fd >= 0 &&
+        (((offset >> 22u) & 1u) != 0u);
+    int *direct_fd = use_replica ? &g_model_replica_direct_fd :
+                                   &g_model_direct_fd;
+    const int buffered_fd = use_replica ? g_model_replica_fd : g_model_fd;
 #if defined(__linux__) && defined(O_DIRECT)
-    if (g_model_direct_fd >= 0 && g_model_direct_align > 1 && g_model_file_size != 0) {
+    if (*direct_fd >= 0 && g_model_direct_align > 1 && g_model_file_size != 0) {
         const uint64_t aligned_off = cuda_round_down(offset, g_model_direct_align);
         const uint64_t delta = offset - aligned_off;
         uint64_t read_size = cuda_round_up(delta + bytes, g_model_direct_align);
@@ -2298,8 +2374,13 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             read_size <= g_model_file_size - aligned_off) {
             const int saved_errno = errno;
             errno = 0;
-            if (cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            if (cuda_pread_full(*direct_fd, stage, read_size, aligned_off)) {
                 *payload = (const char *)stage + delta;
+                if (use_replica) {
+                    __sync_fetch_and_add(&g_model_replica_read_bytes, read_size);
+                } else {
+                    __sync_fetch_and_add(&g_model_primary_read_bytes, read_size);
+                }
                 errno = saved_errno;
                 return 1;
             }
@@ -2308,9 +2389,8 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
                 }
-                (void)close(g_model_direct_fd);
-                g_model_direct_fd = -1;
-                g_model_direct_align = 1;
+                (void)close(*direct_fd);
+                *direct_fd = -1;
             }
             errno = direct_errno;
         }
@@ -2318,7 +2398,15 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 #else
     (void)stage_bytes;
 #endif
-    return cuda_pread_full(g_model_fd, stage, bytes, offset);
+    const int ok = cuda_pread_full(buffered_fd, stage, bytes, offset);
+    if (ok) {
+        if (use_replica) {
+            __sync_fetch_and_add(&g_model_replica_read_bytes, bytes);
+        } else {
+            __sync_fetch_and_add(&g_model_primary_read_bytes, bytes);
+        }
+    }
+    return ok;
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -2433,10 +2521,98 @@ static uint32_t cuda_stream_selected_read_threads(void) {
     return (uint32_t)value;
 }
 
+/* Pin only the SSD reader workers to CPUs local to the active CUDA device.
+ * Compute threads and the process as a whole remain under the caller's
+ * scheduler policy.  Automatic mode is deliberately inert on single-node
+ * machines; DS4_CUDA_STREAMING_NUMA_AFFINITY=0 disables it explicitly. */
+static void cuda_stream_reader_bind_numa(int device_id, uint32_t lane) {
+#if defined(__linux__)
+    static thread_local int bound_device = -2;
+    if (bound_device == device_id) return;
+    bound_device = device_id;
+    if (!cuda_env_flag_enabled("DS4_CUDA_STREAMING_NUMA_AFFINITY", 1)) return;
+
+    FILE *online = fopen("/sys/devices/system/node/online", "r");
+    char online_buf[128] = {0};
+    const bool multi_node = online &&
+        fgets(online_buf, sizeof(online_buf), online) &&
+        (strchr(online_buf, '-') || strchr(online_buf, ','));
+    if (online) fclose(online);
+    if (!multi_node) return;
+
+    char bus_id[32] = {0};
+    if (cudaDeviceGetPCIBusId(bus_id, (int)sizeof(bus_id), device_id) !=
+        cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus_id);
+    FILE *node_file = fopen(path, "r");
+    int node = -1;
+    if (!node_file || fscanf(node_file, "%d", &node) != 1 || node < 0) {
+        if (node_file) fclose(node_file);
+        return;
+    }
+    fclose(node_file);
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/node/node%d/cpulist", node);
+    FILE *cpu_file = fopen(path, "r");
+    char cpulist[1024] = {0};
+    if (!cpu_file || !fgets(cpulist, sizeof(cpulist), cpu_file)) {
+        if (cpu_file) fclose(cpu_file);
+        return;
+    }
+    fclose(cpu_file);
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    char *cursor = cpulist;
+    uint32_t cpu_count = 0;
+    while (*cursor) {
+        char *end = NULL;
+        long first = strtol(cursor, &end, 10);
+        if (end == cursor || first < 0) break;
+        long last = first;
+        cursor = end;
+        if (*cursor == '-') {
+            cursor++;
+            last = strtol(cursor, &end, 10);
+            if (end == cursor || last < first) break;
+            cursor = end;
+        }
+        for (long cpu = first; cpu <= last && cpu < CPU_SETSIZE; cpu++) {
+            CPU_SET((int)cpu, &set);
+            cpu_count++;
+        }
+        if (*cursor != ',') break;
+        cursor++;
+    }
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        CPU_AND(&set, &set, &allowed);
+        cpu_count = (uint32_t)CPU_COUNT(&set);
+    }
+    if (cpu_count == 0 ||
+        pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+        return;
+    }
+    fprintf(stderr,
+            "ds4: CUDA SSD reader %u bound to GPU%d-local NUMA node %d "
+            "(%u CPUs)\n",
+            lane, device_id, node, cpu_count);
+#else
+    (void)device_id;
+    (void)lane;
+#endif
+}
+
 static void cuda_stream_parallel_read_run(
         cuda_stream_parallel_read_ctx *ctx,
         uint32_t lane) {
     bool in_flight = false;
+
+    cuda_stream_reader_bind_numa(ctx->device_id, lane);
 
     cudaError_t err = cudaSetDevice(ctx->device_id);
     if (err != cudaSuccess) {
@@ -3448,9 +3624,25 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_fd = -1;
+    if (g_model_replica_fd >= 0 &&
+        getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: CUDA dual-device model read bytes primary=%llu "
+                "replica=%llu\n",
+                (unsigned long long)g_model_primary_read_bytes,
+                (unsigned long long)g_model_replica_read_bytes);
+    }
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
+    }
+    if (g_model_replica_direct_fd >= 0) {
+        (void)close(g_model_replica_direct_fd);
+        g_model_replica_direct_fd = -1;
+    }
+    if (g_model_replica_fd >= 0) {
+        (void)close(g_model_replica_fd);
+        g_model_replica_fd = -1;
     }
     g_model_direct_align = 1;
     g_model_file_size = 0;
@@ -4818,6 +5010,25 @@ extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t byte
     return d;
 }
 
+static int cuda_model_replica_samples_match(
+        int primary_fd, int replica_fd, uint64_t bytes) {
+    if (primary_fd < 0 || replica_fd < 0 || bytes == 0) return 0;
+    unsigned char primary[4096];
+    unsigned char replica[4096];
+    const uint64_t sample_bytes = bytes < sizeof(primary) ?
+        bytes : sizeof(primary);
+    for (uint32_t i = 0; i < 11u; i++) {
+        uint64_t offset = bytes > sample_bytes ?
+            ((bytes - sample_bytes) * i) / 10u : 0u;
+        if (!cuda_pread_full(primary_fd, primary, sample_bytes, offset) ||
+            !cuda_pread_full(replica_fd, replica, sample_bytes, offset) ||
+            memcmp(primary, replica, (size_t)sample_bytes) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Strict per-device selective-cache lookup.
  *
  * Returns 1 only if a covering entry exists whose device_id matches the
@@ -4871,12 +5082,47 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
     }
+    if (g_model_replica_direct_fd >= 0) {
+        (void)close(g_model_replica_direct_fd);
+        g_model_replica_direct_fd = -1;
+    }
+    if (g_model_replica_fd >= 0) {
+        (void)close(g_model_replica_fd);
+        g_model_replica_fd = -1;
+    }
+    g_model_primary_read_bytes = 0;
+    g_model_replica_read_bytes = 0;
     g_model_direct_align = 1;
     if (fd >= 0) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             g_model_file_size = (uint64_t)st.st_size;
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
+        }
+        const char *replica_path = getenv("DS4_CUDA_MODEL_REPLICA_PATH");
+        if (replica_path && replica_path[0] && g_model_file_size != 0) {
+            int replica_fd = open(replica_path, O_RDONLY);
+            struct stat replica_st;
+            if (replica_fd < 0 || fstat(replica_fd, &replica_st) != 0 ||
+                (uint64_t)replica_st.st_size != g_model_file_size ||
+                !cuda_model_replica_samples_match(
+                    fd, replica_fd, g_model_file_size)) {
+                fprintf(stderr,
+                        "ds4: CUDA model replica must exist and match sampled "
+                        "primary model contents and size: %s\n", replica_path);
+                if (replica_fd >= 0) (void)close(replica_fd);
+            } else {
+                g_model_replica_fd = replica_fd;
+#if defined(__linux__) && defined(O_DIRECT)
+                if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {
+                    g_model_replica_direct_fd =
+                        open(replica_path, O_RDONLY | O_DIRECT);
+                }
+#endif
+                fprintf(stderr,
+                        "ds4: CUDA deterministic dual-device model reads "
+                        "enabled (4 MiB stripes): %s\n", replica_path);
+            }
         }
 #if defined(__linux__) && defined(O_DIRECT)
         if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {
@@ -26761,6 +27007,8 @@ static int cuda_stream_layer_cache_prepare(
     g_stream_layer_cache.prompt_config = cuda_stream_prompt_cache_config();
     g_stream_layer_cache.prompt_policy_enabled = cuda_env_flag_enabled(
         "DS4_CUDA_PROMPT_EXPERT_CACHE", 0);
+    g_stream_layer_cache.dynamic_tier_promotion_enabled =
+        cuda_env_flag_enabled("DS4_CUDA_DYNAMIC_TIER_PROMOTION", 1);
     g_stream_layer_cache.prompt_policy_phase =
         g_stream_prompt_lifecycle_phase;
     g_stream_layer_cache.prompt_generation =
@@ -26771,6 +27019,11 @@ static int cuda_stream_layer_cache_prepare(
             (double)weight_bytes / 1073741824.0,
             capacity,
             table->n_layer);
+    if (g_stream_layer_cache.dynamic_tier_promotion_enabled) {
+        fprintf(stderr,
+                "ds4: CUDA dynamic SSD->VRAM expert promotion enabled "
+                "(frequency/LRU admission)\n");
+    }
     if (g_stream_layer_cache.prompt_policy_enabled) {
         fprintf(stderr,
                 "ds4: CUDA prompt-aware expert cache enabled "
@@ -26856,16 +27109,18 @@ static void cuda_stream_layer_cache_note_routes(
         if (expert < 0 || (uint32_t)expert >= table->n_total_expert) continue;
         cuda_stream_frequency_increment(cuda_stream_layer_cache_frequency(
             table->layer, (uint32_t)expert));
-        if (g_stream_layer_cache.prompt_policy_enabled) {
-            cuda_stream_frequency_increment(
-                cuda_stream_layer_cache_session_frequency(
-                    table->layer, (uint32_t)expert));
-            if (g_stream_layer_cache.prompt_policy_phase !=
+        if (g_stream_layer_cache.prompt_policy_enabled || g_prefix_active) {
+            if (g_stream_prompt_lifecycle_phase !=
                     DS4_PROMPT_CACHE_PHASE_IDLE) {
                 cuda_stream_frequency_increment(
                     cuda_stream_layer_cache_prompt_frequency(
                         table->layer, (uint32_t)expert));
             }
+        }
+        if (g_stream_layer_cache.prompt_policy_enabled) {
+            cuda_stream_frequency_increment(
+                cuda_stream_layer_cache_session_frequency(
+                    table->layer, (uint32_t)expert));
         }
     }
 }
@@ -26894,6 +27149,11 @@ static int cuda_stream_layer_cache_admission_slot(
         g_stream_prompt_lifecycle_phase == DS4_PROMPT_CACHE_PHASE_DECODE &&
         cuda_env_flag_enabled("DS4_CUDA_DECODE_CACHE_LRU", 0);
     const uint32_t phase = g_stream_layer_cache.prompt_policy_phase;
+    const bool prefix_prefill = g_prefix_active &&
+        g_stream_prompt_lifecycle_phase == DS4_PROMPT_CACHE_PHASE_PREFILL &&
+        g_prefix_active->observations >= 2;
+    const uint16_t candidate_prefix = prefix_prefill ?
+        cuda_prefix_profile_frequency(layer, (uint32_t)expert) : 0;
     const uint64_t candidate_prompt = prompt_policy ?
         *cuda_stream_layer_cache_prompt_frequency(layer, (uint32_t)expert) : 0;
     const uint64_t candidate_session = prompt_policy ?
@@ -26909,6 +27169,7 @@ static int cuda_stream_layer_cache_admission_slot(
     uint64_t victim_prompt = UINT64_MAX;
     uint64_t victim_session = UINT64_MAX;
     uint64_t victim_used = UINT64_MAX;
+    uint16_t victim_prefix = UINT16_MAX;
     for (uint32_t slot = begin; slot < end; slot++) {
         const cuda_stream_layer_cache_slot *entry =
             &g_stream_layer_cache.slots[slot];
@@ -26944,8 +27205,16 @@ static int cuda_stream_layer_cache_admission_slot(
             session_count = cuda_stream_layer_cache_history_frequency(
                 layer, (uint32_t)entry->expert);
         }
+        const uint16_t prefix_count = prefix_prefill ?
+            cuda_prefix_profile_frequency(layer, (uint32_t)entry->expert) : 0;
         const bool lower = decode_lru ?
             entry->last_used < victim_used :
+            prefix_prefill ?
+            (count < victim_frequency ||
+             (count == victim_frequency &&
+              (prefix_count < victim_prefix ||
+               (prefix_count == victim_prefix &&
+                entry->last_used < victim_used)))) :
             prompt_policy ?
             (prompt_count < victim_prompt ||
              (prompt_count == victim_prompt &&
@@ -26960,11 +27229,33 @@ static int cuda_stream_layer_cache_admission_slot(
             victim_prompt = prompt_count;
             victim_session = session_count;
             victim_used = entry->last_used;
+            victim_prefix = prefix_count;
         }
     }
 
     if (victim < 0) return -1;
+    /* Static mode is a diagnostic control: fill empty VRAM slots, then keep
+     * the first resident set. Automatic mode promotes a hotter SSD candidate
+     * by evicting the cold victim selected above. */
+    if (!g_stream_layer_cache.dynamic_tier_promotion_enabled) {
+        return -1;
+    }
     if (decode_lru) return victim;
+    if (prefix_prefill) {
+        uint64_t *candidate_frequency = cuda_stream_layer_cache_frequency(
+            layer, (uint32_t)expert);
+        const uint64_t candidate_count = candidate_frequency ?
+            *candidate_frequency : 0;
+        if (candidate_prefix == 0 ||
+            candidate_count < victim_frequency ||
+            (candidate_count == victim_frequency &&
+             candidate_prefix <= victim_prefix)) {
+            g_prefix_profile_rejections++;
+            return -1;
+        }
+        g_prefix_profile_admissions++;
+        return victim;
+    }
     if (prefill_probation) {
         g_stream_layer_cache.prefill_single_use_bypasses++;
         return -1;
@@ -27236,6 +27527,12 @@ static int cuda_stream_selected_cache_begin_load(
                 }
             }
             g_stream_layer_cache.hits++;
+            if (g_prefix_active &&
+                g_stream_prompt_lifecycle_phase == DS4_PROMPT_CACHE_PHASE_PREFILL &&
+                cuda_prefix_profile_frequency(table->layer,
+                                              (uint32_t)expert) != 0) {
+                g_prefix_profile_hits++;
+            }
             g_stream_layer_cache.cache_hit_bytes += expert_payload_bytes;
             persistent_slots[i] = persistent_slot;
             persistent_hits[i] = 1;
@@ -31739,13 +32036,22 @@ static void cuda_stream_prompt_cache_clear_protection(void) {
     g_stream_layer_cache.session_protected_resident = 0;
 }
 
-static void cuda_stream_prompt_cache_begin_internal(void) {
+static void cuda_stream_prompt_cache_begin_internal(
+        uint64_t prefix_key, uint32_t cached_tokens) {
     g_stream_prompt_lifecycle_phase = DS4_PROMPT_CACHE_PHASE_PREFILL;
     if (g_stream_prompt_lifecycle_generation != UINT64_MAX) {
         g_stream_prompt_lifecycle_generation++;
     }
-    if (!g_stream_layer_cache.valid ||
-        !g_stream_layer_cache.prompt_policy_enabled) {
+    cuda_prefix_expert_profile *prefix =
+        cuda_prefix_profile_select(prefix_key);
+    g_prefix_cached_tokens = prefix ? cached_tokens : 0;
+    if (prefix && !prefix->frequency) {
+        const size_t cells = cuda_prefix_profile_cells();
+        if (cells) prefix->frequency =
+            (uint16_t *)calloc(cells, sizeof(uint16_t));
+        if (cells && !prefix->frequency) g_prefix_active = NULL;
+    }
+    if (!g_stream_layer_cache.valid) {
         return;
     }
     g_stream_layer_cache.prompt_policy_phase =
@@ -31753,12 +32059,14 @@ static void cuda_stream_prompt_cache_begin_internal(void) {
     g_stream_layer_cache.prompt_generation =
         g_stream_prompt_lifecycle_generation;
     g_stream_layer_cache.decode_token = 0;
-    if (g_stream_layer_cache.prompt_frequency) {
+    if ((g_stream_layer_cache.prompt_policy_enabled || g_prefix_active) &&
+        g_stream_layer_cache.prompt_frequency) {
         memset(g_stream_layer_cache.prompt_frequency,
                0,
                (size_t)g_stream_layer_cache.layer_count *
                    g_stream_layer_cache.n_total_expert * sizeof(uint64_t));
     }
+    if (!g_stream_layer_cache.prompt_policy_enabled) return;
     cuda_stream_prompt_cache_clear_protection();
 
     /* Carry a small global-hot partition into the next prompt. Prompt
@@ -31819,6 +32127,32 @@ static void cuda_stream_prompt_cache_begin_internal(void) {
 
 static void cuda_stream_prompt_cache_finish_prefill_internal(void) {
     g_stream_prompt_lifecycle_phase = DS4_PROMPT_CACHE_PHASE_DECODE;
+    if (g_prefix_active && g_prefix_active->frequency &&
+        g_stream_layer_cache.prompt_frequency) {
+        const size_t cells = cuda_prefix_profile_cells();
+        for (size_t i = 0; i < cells; i++) {
+            /* Retain recent suffix behavior without letting an early prompt
+             * dominate forever. A hit from the previous observation remains
+             * strong enough to influence the next prefill admission. */
+            uint32_t score = ((uint32_t)g_prefix_active->frequency[i] * 3u) / 4u;
+            const uint64_t seen = g_stream_layer_cache.prompt_frequency[i];
+            score += seen > 255u ? 255u : (uint32_t)seen;
+            g_prefix_active->frequency[i] =
+                (uint16_t)(score > UINT16_MAX ? UINT16_MAX : score);
+        }
+        if (g_prefix_active->observations != UINT32_MAX) {
+            g_prefix_active->observations++;
+        }
+        if (getenv("DS4_CUDA_PREFIX_EXPERT_PROFILE")) {
+            fprintf(stderr,
+                    "ds4: CUDA prefix expert profile key=%016llx cached=%u observations=%u admissions=%llu rejections=%llu\n",
+                    (unsigned long long)g_prefix_active->key,
+                    g_prefix_cached_tokens,
+                    g_prefix_active->observations,
+                    (unsigned long long)g_prefix_profile_admissions,
+                    (unsigned long long)g_prefix_profile_rejections);
+        }
+    }
     if (!g_stream_layer_cache.valid ||
         !g_stream_layer_cache.prompt_policy_enabled) {
         return;
@@ -31937,6 +32271,8 @@ static void cuda_stream_prompt_cache_finish_prefill_internal(void) {
 
 static void cuda_stream_prompt_cache_end_internal(void) {
     g_stream_prompt_lifecycle_phase = DS4_PROMPT_CACHE_PHASE_IDLE;
+    g_prefix_active = NULL;
+    g_prefix_cached_tokens = 0;
     if (!g_stream_layer_cache.valid ||
         !g_stream_layer_cache.prompt_policy_enabled) {
         return;
@@ -31946,8 +32282,9 @@ static void cuda_stream_prompt_cache_end_internal(void) {
     cuda_stream_prompt_cache_clear_protection();
 }
 
-extern "C" void ds4_gpu_stream_expert_cache_prompt_begin(void) {
-    cuda_stream_prompt_cache_begin_internal();
+extern "C" void ds4_gpu_stream_expert_cache_prompt_begin(
+        uint64_t prefix_key, uint32_t cached_tokens) {
+    cuda_stream_prompt_cache_begin_internal(prefix_key, cached_tokens);
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_prefill_end(void) {
@@ -32175,6 +32512,23 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     }
     return cuda_stream_selected_cache_begin_load(
             table, selected_ids, n_tokens * n_selected);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_set_selected_slot_offset(
+        uint32_t slot_offset) {
+    if (!g_stream_selected_cache.valid ||
+        slot_offset > g_stream_selected_cache.slot_count ||
+        (uint64_t)slot_offset * sizeof(int32_t) >
+            g_stream_selected_cache.slot_selected_capacity) {
+        return 0;
+    }
+    g_stream_selected_cache.slot_selected_tensor.ptr =
+        g_stream_selected_cache.slot_selected_ptr +
+        (uint64_t)slot_offset * sizeof(int32_t);
+    g_stream_selected_cache.slot_selected_tensor.bytes =
+        (uint64_t)(g_stream_selected_cache.slot_count - slot_offset) *
+        sizeof(int32_t);
+    return 1;
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(

@@ -7,8 +7,8 @@ cd "$script_dir"
 # This launcher is intentionally pinned to the measured definitive CUDA build.
 # A pull, rebuild, or accidental switch to another experimental backend must
 # not be started under this profile without being verified first.
-readonly DS4_RECOVERED_CUDA_BLOB="a7de59b363cc26ce533da7737a99f0b4b714e71f"
-readonly DS4_RECOVERED_BINARY_SHA256="789477561f110164da7f0a7377b89193966c4a5a1eb73f60a8b676f9c2514e09"
+readonly DS4_RECOVERED_CUDA_BLOB="6a54ff870e6899736847b86c8161ba8d42d65f86"
+readonly DS4_RECOVERED_BINARY_SHA256="47bb66d6cce2959083c92dec75896d571703c1745177c86a8c3eb3518ebc3302"
 
 if ! command -v git >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
     printf 'DS4 recovered guard: git and sha256sum are required.\n' >&2
@@ -50,16 +50,22 @@ export DS4_CUDA_NO_Q8_F16_CACHE=1
 export DS4_CUDA_STREAMING_READ_THREADS="${DS4_CUDA_STREAMING_READ_THREADS:-4}"
 export DS4_CUDA_STREAMING_SMALL_MISS_PARALLEL="${DS4_CUDA_STREAMING_SMALL_MISS_PARALLEL:-1}"
 export DS4_CUDA_STREAMING_PERSISTENT_READERS="${DS4_CUDA_STREAMING_PERSISTENT_READERS:-1}"
+# On multi-node Linux hosts, pin only these I/O workers to the GPU-local NUMA
+# node. The CUDA runtime leaves single-node machines and all compute threads
+# untouched.
+export DS4_CUDA_STREAMING_NUMA_AFFINITY="${DS4_CUDA_STREAMING_NUMA_AFFINITY:-1}"
 
 # Decode LRU improved cache reuse for this prompt mix. Prefill/shared overlap
 # is correct but measured neutral, so leave that experimental path disabled.
 export DS4_CUDA_DECODE_CACHE_LRU="${DS4_CUDA_DECODE_CACHE_LRU:-1}"
+export DS4_CUDA_DYNAMIC_TIER_PROMOTION="${DS4_CUDA_DYNAMIC_TIER_PROMOTION:-1}"
 export DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP="${DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP:-0}"
 
 # The prompt-aware policy is experimental. A/B tests on this machine did not
 # show a repeatable speedup, so keep the measured baseline unless explicitly
 # enabled by the caller.
 export DS4_CUDA_PROMPT_EXPERT_CACHE="${DS4_CUDA_PROMPT_EXPERT_CACHE:-0}"
+export DS4_CUDA_PREFIX_EXPERT_CACHE="${DS4_CUDA_PREFIX_EXPERT_CACHE:-0}"
 
 # The record profile predates the experimental cache/trace paths. Force them
 # out of the latency-sensitive launcher; the A/B runner can still enable them.
@@ -68,7 +74,7 @@ unset DS4_CUDA_LAYER_CACHE_CAPACITIES_FILE
 unset DS4_CUDA_PINNED_EXPERTS_FILE
 unset DS4_CUDA_PINNED_EXPERTS_PREFILL_ONLY
 unset DS4_CUDA_CACHE_SUMMARY
-unset DS4_EXPERT_TRACE_FILE
+unset DS4_EXPERT_TRACE
 unset DS4_EXPERT_TRACE_LOGITS
 
 # The upstream weight arena defaults to 1792 MiB chunks. On this 16 GiB GPU,
@@ -87,6 +93,19 @@ export DS4_CUDA_LAZY_KV_INITIAL_TOKENS="${DS4_CUDA_LAZY_KV_INITIAL_TOKENS:-4096}
 # did not improve median prefill/decode time on the measured prompt mix.
 # Example:
 # export DS4_CUDA_PINNED_EXPERTS_FILE="$PWD/profiles/ds4-flash-0731-prefill-pinned-conservative.txt"
+
+# Optional byte-identical copy on a second physical SSD. Reads are assigned in
+# deterministic 4 MiB stripes; do not point this at a second path on one SSD.
+# export DS4_CUDA_MODEL_REPLICA_PATH=/mnt/second-ssd/ds4flash.gguf
+
+# Server-batch audit: reports one unioned routed dispatch per layer (two owner
+# kernels under tensor parallelism), including cumulative grouped row counts.
+# export DS4_CUDA_SESSION_BATCH_PROFILE=1
+# export DS4_CUDA_SESSION_BATCH_SSD_UNION=1  # measured slower; audit only
+
+# Demand-prefetch effectiveness and async-loader contention. Predictive
+# prefetch should only be enabled after this reports low waits/contention.
+# export DS4_CUDA_PREFETCH_TELEMETRY=1
 
 exec ./ds4 \
     --cuda \

@@ -108,6 +108,9 @@ int main(void) {
         return 1;
     }
     const bool server_prefill = getenv("DS4_TEST_SERVER_PREFILL") != NULL;
+    const bool ssd_streaming = getenv("DS4_TEST_SSD_STREAMING") != NULL;
+    const bool identical_prompts =
+        getenv("DS4_TEST_IDENTICAL_PROMPTS") != NULL;
 
     int session_count = DEFAULT_SESSION_COUNT;
     const char *session_count_env = getenv("DS4_TEST_SESSION_COUNT");
@@ -118,6 +121,17 @@ int main(void) {
         fprintf(stderr,
                 "FAIL: DS4_TEST_SESSION_COUNT must be between 2 and %d\n",
                 MAX_SESSION_COUNT);
+        return 1;
+    }
+    int decode_steps = DECODE_STEPS;
+    const char *decode_steps_env = getenv("DS4_TEST_DECODE_STEPS");
+    if (decode_steps_env && decode_steps_env[0]) {
+        decode_steps = atoi(decode_steps_env);
+    }
+    if (decode_steps < 1 || decode_steps > DECODE_STEPS) {
+        fprintf(stderr,
+                "FAIL: DS4_TEST_DECODE_STEPS must be between 1 and %d\n",
+                DECODE_STEPS);
         return 1;
     }
 
@@ -158,9 +172,10 @@ int main(void) {
     ds4_gpu_config gpu_cfg = {0};
     bool skip_cuda = false;
     char err[256] = {0};
-    if (parse_gpu_vram_arg("auto", "0,2,4,6,1,3,5,7",
+    if (!ssd_streaming &&
+        (parse_gpu_vram_arg("auto", "0,2,4,6,1,3,5,7",
                            &gpu_cfg, &skip_cuda, err, sizeof(err)) != 0 ||
-        skip_cuda) {
+         skip_cuda)) {
         fprintf(stderr, "FAIL: GPU configuration: %s\n", err);
         return 1;
     }
@@ -169,12 +184,18 @@ int main(void) {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
         .n_threads = 1,
-        .cuda_tensor_parallel = true,
+        .cuda_tensor_parallel = !ssd_streaming,
+        .ssd_streaming = ssd_streaming,
+        .ssd_streaming_cache_bytes =
+            ssd_streaming ? UINT64_C(8) * 1024u * 1024u * 1024u : 0u,
         .share_session_prefill_workspace = true,
         .placement_ctx_hint = (uint32_t)test_ctx,
     };
     ds4_engine *engine = NULL;
-    if (ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
+    const int engine_rc = ssd_streaming ?
+        ds4_engine_create_with_gpu_config(&engine, &opt, NULL) :
+        ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg);
+    if (engine_rc != 0) {
         fprintf(stderr, "FAIL: engine open\n");
         return 1;
     }
@@ -184,14 +205,14 @@ int main(void) {
     const int prompt_count = (int)(sizeof(prompts) / sizeof(prompts[0]));
     for (int i = 0; i < session_count; i++) {
         const char *prompt_text = long_prompt && (i & 1) == 0
-            ? long_prompt : prompts[i % prompt_count];
+            ? long_prompt : prompts[identical_prompts ? 0 : i % prompt_count];
         ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE,
                                &prompt[i]);
         if (long_prompt && (i & 1) == 0) {
             fprintf(stderr,
                     "test_cuda_session_batch long prompt session=%d tokens=%d\n",
                     i, prompt[i].len);
-            if (prompt[i].len + DECODE_STEPS >= test_ctx) {
+            if (prompt[i].len + decode_steps >= test_ctx) {
                 fail("long prompt exceeds decode context", i, -1);
             }
         }
@@ -209,7 +230,7 @@ int main(void) {
     }
 
     const int vocab = ds4_engine_vocab_size(engine);
-    const size_t frontiers = (size_t)(DECODE_STEPS + 1) * (size_t)session_count;
+    const size_t frontiers = (size_t)(decode_steps + 1) * (size_t)session_count;
     float *expected = malloc(frontiers * (size_t)vocab * sizeof(*expected));
     int *expected_argmax = malloc(frontiers * sizeof(*expected_argmax));
     float *actual = malloc((size_t)vocab * sizeof(*actual));
@@ -222,7 +243,7 @@ int main(void) {
     uint64_t evaluated_rows = 0;
     double evaluated_ms = 0.0;
     const bool power_of_two = (session_count & (session_count - 1)) == 0;
-    for (int step = 0; step <= DECODE_STEPS; step++) {
+    for (int step = 0; step <= decode_steps; step++) {
         int tokens[MAX_SESSION_COUNT];
         for (int i = 0; i < session_count; i++) {
             const size_t frontier =
@@ -235,7 +256,7 @@ int main(void) {
             tokens[i] = ds4_session_argmax(batched[i]);
             expected_argmax[frontier] = tokens[i];
         }
-        if (step == DECODE_STEPS) break;
+        if (step == decode_steps) break;
 
         const int group = !power_of_two ? session_count :
                           step % 3 == 0 ? session_count :
@@ -292,7 +313,7 @@ int main(void) {
                 "test_cuda_session_batch PASS batch-only sessions=%d steps=%d "
                 "frontier0_hash=%016llx logit_hash=%016llx "
                 "argmax_hash=%016llx\n",
-                session_count, DECODE_STEPS,
+                session_count, decode_steps,
                 (unsigned long long)hash_bytes(
                     expected,
                     (size_t)session_count * (size_t)vocab * sizeof(*expected)),
@@ -326,14 +347,14 @@ int main(void) {
             fprintf(stderr, "FAIL: control prefill session=%d: %s\n", i, err);
             return 1;
         }
-        for (int step = 0; step <= DECODE_STEPS; step++) {
+        for (int step = 0; step <= decode_steps; step++) {
             const size_t frontier =
                 (size_t)step * (size_t)session_count + (size_t)i;
             compare_frontier(control,
                              expected + frontier * (size_t)vocab,
                              expected_argmax[frontier], actual, vocab,
                              i, step, &worst_abs, &nonexact);
-            if (step < DECODE_STEPS &&
+            if (step < decode_steps &&
                 ds4_session_eval(control, expected_argmax[frontier],
                                  err, sizeof(err)) != 0) {
                 fprintf(stderr,
@@ -348,7 +369,7 @@ int main(void) {
     fprintf(stderr,
             "test_cuda_session_batch PASS sessions=%d steps=%d "
             "worst_logit_abs=%g nonexact_logits=%d\n",
-            session_count, DECODE_STEPS, worst_abs, nonexact);
+            session_count, decode_steps, worst_abs, nonexact);
 
     free(actual);
     free(expected_argmax);

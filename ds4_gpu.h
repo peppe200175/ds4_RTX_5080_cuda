@@ -252,7 +252,8 @@ typedef struct ds4_gpu_stream_expert_cache_snapshot {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
 int ds4_gpu_stream_expert_cache_get_snapshot(
         ds4_gpu_stream_expert_cache_snapshot *out);
-void ds4_gpu_stream_expert_cache_prompt_begin(void);
+void ds4_gpu_stream_expert_cache_prompt_begin(uint64_t prefix_key,
+                                               uint32_t cached_tokens);
 void ds4_gpu_stream_expert_cache_prefill_end(void);
 void ds4_gpu_stream_expert_cache_prompt_end(void);
 #endif
@@ -287,6 +288,10 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const int32_t                     *selected_ids,
         uint32_t                           n_tokens,
         uint32_t                           n_selected);
+#endif
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+int ds4_gpu_stream_expert_cache_set_selected_slot_offset(
+        uint32_t                           slot_offset);
 #endif
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_stream_expert_cache_load_layer(

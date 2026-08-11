@@ -35,5 +35,6 @@
 __pycache__/
 *.pyc
 /misc/
+/logs/
 .*.swp
 .DS_Store

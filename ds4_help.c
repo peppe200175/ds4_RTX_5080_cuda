@@ -282,6 +282,8 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "DS4_CUDA_STREAMING_PERSISTENT_READERS=1", "CUDA SSD streaming: reuse direct-I/O reader threads between expert misses.");
     opt(fp, c, "DS4_CUDA_DECODE_CACHE_LRU=1", "CUDA SSD streaming: use layer-local LRU replacement during decode.");
     opt(fp, c, "DS4_CUDA_STREAMING_PREFILL_SHARED_OVERLAP=1", "CUDA SSD streaming: overlap selected-batch loading with the shared expert (experimental).");
+    opt(fp, c, "DS4_CUDA_PREFIX_EXPERT_CACHE=1", "CUDA SSD streaming: learn suffix experts per reused KV prefix and bias prefill admission (experimental).");
+    opt(fp, c, "DS4_CUDA_PREFIX_EXPERT_PROFILE=1", "Print KV-prefix expert-cache observations and admission counters.");
     opt(fp, c, "--perplexity-file FILE", "Score raw text with teacher-forced NLL.");
     opt(fp, c, "--imatrix-dataset FILE", "Rendered prompt dataset for imatrix collection.");
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");
