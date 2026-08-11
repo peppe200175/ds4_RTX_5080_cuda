@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /mnt/c/Users/gmart/OneDrive/ds4
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir"
 
 # This launcher is intentionally pinned to the measured definitive CUDA build.
 # A pull, rebuild, or accidental switch to another experimental backend must

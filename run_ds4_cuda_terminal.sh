@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-cd /mnt/c/Users/gmart/OneDrive/ds4 || exit 1
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir" || exit 1
 mkdir -p logs/interactive
 log_file="logs/interactive/ds4_cuda_$(date -u +%Y%m%dT%H%M%SZ).log"
 printf 'DS4 CUDA interactive log: %s\n' "$log_file"
