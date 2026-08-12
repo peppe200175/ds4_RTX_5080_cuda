@@ -119,6 +119,16 @@ foundation, and adds or changes the following RTX 5080 paths:
   policy tests, long-context tests, and CUDA session-batch checks.
 - **Operational tooling:** native WSL launchers, interactive log capture,
   CUDA Docker files, and generated-log exclusion in `.gitignore`.
+- **Built-in Chat and Monitor UI:** the server root page provides streaming
+  chat, optional reasoning displayed separately from the final answer,
+  per-prompt performance data, live disk/cache charts, and a per-expert cache
+  hit/miss map.
+- **Controlled web restart:** loopback deployments can restart from the UI.
+  The server drains requests, releases CUDA/model resources, and re-executes
+  the same binary with its original arguments and environment.
+- **Server startup warm-up:** CUDA kernel setup and lazy model residency happen
+  before the listener opens, keeping one-time multi-gigabyte tensor loading out
+  of the first user's reported prefill latency.
 
 ## Requirements
 
@@ -195,6 +205,52 @@ last command with:
   --ssd-streaming --ssd-streaming-cache-experts 8GB \
   --prefill-chunk 1024 --ctx 131072 --port 8080
 ```
+
+### Built-in Web UI
+
+Open the server address in a browser after startup. With the measured WSL
+launcher, the default URL is:
+
+```text
+http://127.0.0.1:18099
+```
+
+The page has two views:
+
+- **Chat** streams OpenAI-compatible chat completions directly from the local
+  server. The **Thinking** checkbox switches between
+  `reasoning_effort: "none"` and `reasoning_effort: "high"`. When enabled,
+  streamed `reasoning_content` appears in a separate amber collapsible panel;
+  the final answer remains in the normal assistant message. The preference is
+  remembered in the browser.
+- **Monitor** shows model health and uptime, cache hit rate, disk bytes and read
+  latency, NVMe throughput, rolling charts, and completed-prompt timing. The
+  expert cache map has one cell per expert ID: green means mostly VRAM cache
+  hits, orange means mostly SSD misses, brightness represents access volume,
+  and hover text gives exact hit/miss totals and hit rate.
+
+The header's **Restart server** button is deliberately restricted to a server
+bound to `127.0.0.1`, `localhost`, or `::1`. After confirmation it posts to
+`/admin/restart`, gracefully drains the process, and relaunches the same
+executable with the current model path, context, cache budget, port, other
+arguments, and environment. The page waits for recovery and reloads itself.
+Active generations are stopped by a restart. If the page is connected to an
+older binary without the endpoint, the button is disabled and one manual
+restart is required.
+
+Relevant read-only monitoring endpoints are:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Model, uptime, global expert-cache totals, and disk metrics |
+| `GET /profile` | Recent per-prompt TTFT, prefill, generation, KV, expert, and disk statistics |
+| `GET /metrics/stream` | One-second Server-Sent Events used by the live charts |
+| `GET /experts` | Per-expert cache hits and misses used by the expert map |
+| `GET /admin/restart` | Reports whether guarded web restart is available |
+
+The UI is served from `web/index.html` and has no JavaScript build step. HTML
+and styling changes appear after a hard refresh; C endpoint changes require a
+server rebuild and restart.
 
 ## Automatic tuning
 

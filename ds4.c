@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_metrics.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -1316,7 +1317,8 @@ static void ds4_json_write_string(FILE *fp, const char *s) {
 }
 
 static void ds4_expert_profile_init(const char *path, const char *hotlist_path) {
-    if ((!path || !path[0]) && (!hotlist_path || !hotlist_path[0])) return;
+    const bool want_enable = path != NULL;  /* "" means: enable, no file out */
+    if (!want_enable && (!hotlist_path || !hotlist_path[0])) return;
     if (g_expert_profile.active) {
         free(g_expert_profile.path);
         free(g_expert_profile.hotlist_path);
@@ -1601,10 +1603,75 @@ static void ds4_expert_profile_write_hotlist_file(ds4_expert_profile *p) {
     }
 }
 
+void ds4_expert_map_enable(void) {
+    if (g_expert_profile.active) return;
+    ds4_expert_profile_init("", NULL);
+}
+
+int ds4_expert_map_snapshot(uint8_t *heat, uint32_t heat_layers,
+                            uint32_t *experts,
+                            uint32_t *top_layers, uint32_t *top_experts,
+                            uint32_t *top_counts, uint32_t top_cells) {
+    const ds4_expert_profile *p = &g_expert_profile;
+    if (!p->active || p->n_layer == 0 || p->n_expert == 0 ||
+        p->total_selections == 0) {
+        if (experts) *experts = 0;
+        return 0;
+    }
+    if (experts) *experts = p->n_expert;
+
+    uint32_t layers = p->n_layer;
+    if (layers > DS4_MAX_LAYER) layers = DS4_MAX_LAYER;
+
+    if (heat && heat_layers) {
+        const uint32_t copy_layers =
+            layers < heat_layers ? layers : heat_layers;
+        uint64_t max_count = 0;
+        for (uint32_t il = 0; il < copy_layers; il++)
+            for (uint32_t e = 0; e < p->n_expert; e++)
+                if (p->hist[il][e] > max_count) max_count = p->hist[il][e];
+        for (uint32_t il = 0; il < copy_layers; il++)
+            for (uint32_t e = 0; e < p->n_expert; e++) {
+                const uint64_t c = p->hist[il][e];
+                heat[(size_t)il * p->n_expert + e] =
+                    (c == 0 || max_count == 0) ? 0 :
+                    (uint8_t)(1u + (uint32_t)(c * 254u / max_count));
+            }
+    }
+
+    if (top_layers && top_experts && top_counts && top_cells) {
+        /* Selection-sort the hottest cells into the caller's arrays. */
+        uint32_t filled = 0;
+        for (uint32_t il = 0; il < layers; il++)
+            for (uint32_t e = 0; e < p->n_expert; e++) {
+                const uint64_t c = p->hist[il][e];
+                if (c == 0) continue;
+                uint32_t pos = filled < top_cells ? filled : top_cells;
+                if (pos == top_cells) {
+                    if (c <= top_counts[top_cells - 1]) continue;
+                    pos = top_cells - 1;
+                } else {
+                    filled++;
+                }
+                while (pos > 0 && c > top_counts[pos - 1]) {
+                    if (pos < top_cells) {
+                        top_counts[pos] = top_counts[pos - 1];
+                        top_layers[pos] = top_layers[pos - 1];
+                        top_experts[pos] = top_experts[pos - 1];
+                    }
+                    pos--;
+                }
+                top_counts[pos] = (uint32_t)(c > UINT32_MAX ? UINT32_MAX : c);
+                top_layers[pos] = il;
+                top_experts[pos] = e;
+            }
+    }
+    return (int)layers;
+}
+
 static void ds4_expert_profile_close(void) {
     ds4_expert_profile *p = &g_expert_profile;
     if (!p->active) return;
-
     if (p->path) {
         FILE *fp = fopen(p->path, "wb");
         if (!fp) {
@@ -11031,6 +11098,19 @@ static void layer_routed_moe_one_prealloc(
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
 
+    /* Feed the routing profiler on the CPU decode path.  GPU backends record
+     * from their tensor readback instead; doing it here covers --cpu. */
+    if (g_expert_profile.active) {
+        int32_t sel32[DS4_MAX_EXPERT_USED];
+        float w32[DS4_MAX_EXPERT_USED];
+        for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) {
+            sel32[k] = (int32_t)selected[k];
+            w32[k] = expert_weight[k];
+        }
+        ds4_expert_profile_record(il, (uint32_t)token, sel32, w32,
+                                  layer->ffn_gate_tid2eid != NULL);
+    }
+
     if (routed_q8_0) {
         if (!q8_xq || !q8_xscale || !q8_midq || !q8_midscale) {
             ds4_die("missing Q8_0 routed decode scratch");
@@ -18969,6 +19049,7 @@ static bool metal_graph_stream_pread_range(
     }
     if (offset > (uint64_t)LLONG_MAX) return false;
 
+    const double read_t0 = now_sec();
     const size_t chunk = 1024u * 1024u;
     uint8_t *buf = xmalloc(chunk);
     uint64_t pos = offset;
@@ -18994,6 +19075,7 @@ static bool metal_graph_stream_pread_range(
                 UINT64_MAX : *read_bytes + (uint64_t)nread;
         }
     }
+    if (ok) ds4_metrics_disk_read(size, now_sec() - read_t0);
     if (sink) *sink = s;
     free(buf);
     return ok;
@@ -59234,6 +59316,11 @@ int ds4_engine_layer_count(ds4_engine *e) {
         return (int)(DS4_N_LAYER - DS4_N_NEXTN_PREDICT);
     }
     return (int)DS4_N_LAYER;
+}
+
+int ds4_engine_expert_count(ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_EXPERT;
 }
 
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {

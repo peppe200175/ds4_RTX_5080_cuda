@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_metrics.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -39,17 +40,21 @@
 #include <time.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t g_stop_requested = 0;
-static volatile sig_atomic_t g_listen_fd = -1;
-
-#define DS4_SERVER_IO_TIMEOUT_SEC 10
-#define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
-
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
 #else
 #define DS4_SERVER_MAYBE_UNUSED
 #endif
+
+static volatile sig_atomic_t g_stop_requested = 0;
+static volatile sig_atomic_t g_restart_requested = 0;
+static volatile sig_atomic_t g_listen_fd = -1;
+static int g_restart_argc DS4_SERVER_MAYBE_UNUSED;
+static char **g_restart_argv DS4_SERVER_MAYBE_UNUSED;
+static char g_restart_exe[PATH_MAX] DS4_SERVER_MAYBE_UNUSED;
+
+#define DS4_SERVER_IO_TIMEOUT_SEC 10
+#define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
 static void stop_signal_handler(int sig) {
     (void)sig;
@@ -5592,10 +5597,41 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
     return ok;
 }
 
+static bool sse_ds4_stats_chunk(int fd, const request *r);
+
 static bool sse_done(int fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens) {
     return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
+           sse_ds4_stats_chunk(fd, r) &&
            send_all(fd, "data: [DONE]\n\n", 14);
+}
+
+/* Emits the ds4 per-request telemetry frame immediately before [DONE],
+ * mirroring Colibri's {"colibri": {...}} convention.  OpenAI-protocol
+ * streams only (Anthropic/Responses envelopes use their own finish paths),
+ * and only when a prompt record exists — trace_finish() records it before
+ * the streaming tail is flushed. */
+static bool sse_ds4_stats_chunk(int fd, const request *r) {
+    if (!r || r->api != API_OPENAI) return true;
+    ds4_prompt_stat p;
+    if (!ds4_metrics_latest_prompt(&p)) return true;
+    buf b = {0};
+    buf_printf(&b,
+        "data: {\"ds4\":{\"tok_s\":%.2f,\"ttft_s\":%.4f,\"prefill_s\":%.4f,"
+        "\"gen_s\":%.4f,\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+        "\"cache_read_tokens\":%d,\"cache_write_tokens\":%d,"
+        "\"expert_hits\":%llu,\"expert_misses\":%llu,"
+        "\"disk_bytes\":%llu,\"disk_s\":%.4f}}\n\n",
+        p.tok_s, p.ttft_s, p.prefill_s, p.gen_s,
+        p.prompt_tokens, p.completion_tokens,
+        p.cache_read_tokens, p.cache_write_tokens,
+        (unsigned long long)p.expert_hits,
+        (unsigned long long)p.expert_misses,
+        (unsigned long long)p.disk_bytes,
+        p.disk_s);
+    const bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
 }
 
 static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
@@ -8455,6 +8491,7 @@ struct server {
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    bool allow_web_restart;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -10138,7 +10175,38 @@ static void trace_finish(
         const char *parsed_content,
         const char *parsed_reasoning,
         const tool_calls *parsed_calls,
-        double elapsed) {
+        double elapsed,
+        double prefill_s,
+        double ttft_s,
+        const ds4_metrics_snapshot *baseline) {
+    /* Metrics recording must run even when file tracing is disabled, so it
+     * happens before the trace early-return.  Only request data in scope here
+     * is used; anything else stays 0. */
+    ds4_prompt_stat stat = {0};
+    stat.id = id;
+    stat.ts = (double)time(NULL);
+    stat.prompt_tokens = r->prompt.len;
+    stat.completion_tokens = completion;
+    stat.prefill_s = prefill_s;
+    stat.ttft_s = ttft_s;
+    stat.gen_s = elapsed > prefill_s ? elapsed - prefill_s : 0.0;
+    stat.tok_s = stat.gen_s > 0.0 && completion > 0 ?
+        (double)completion / stat.gen_s : 0.0;
+    stat.cache_read_tokens = r->cache_read_tokens;
+    stat.cache_write_tokens = r->cache_write_tokens;
+    if (baseline) {
+        ds4_metrics_snapshot now;
+        ds4_metrics_get_snapshot(&now);
+        stat.expert_hits = now.expert_hits - baseline->expert_hits;
+        stat.expert_misses = now.expert_misses - baseline->expert_misses;
+        stat.disk_bytes = now.disk_bytes - baseline->disk_bytes;
+        stat.disk_s = now.disk_read_s - baseline->disk_read_s;
+        /* CPU mode streams experts via mmap page faults, invisible to the
+         * backend hooks; fall back to /proc/self/io deltas. */
+        if (stat.disk_bytes == 0 && now.proc_read_bytes >= baseline->proc_read_bytes)
+            stat.disk_bytes = now.proc_read_bytes - baseline->proc_read_bytes;
+    }
+    ds4_metrics_record_prompt(&stat);
     if (!s->trace || !id) return;
 
     pthread_mutex_lock(&s->trace_mu);
@@ -11341,6 +11409,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
+    ds4_metrics_snapshot metrics_baseline;
+    ds4_metrics_get_snapshot(&metrics_baseline);
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
@@ -11621,6 +11691,7 @@ decode_again:
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    double first_token_t = 0.0;
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -11665,6 +11736,7 @@ decode_again:
             finish = "stop";
             break;
         }
+        if (first_token_t == 0.0) first_token_t = now_sec();
 
         int toks[17];
         int ntok = 0;
@@ -12157,7 +12229,10 @@ decode_again:
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                 parsed_reasoning, &parsed_calls, now_sec() - t0);
+                 parsed_reasoning, &parsed_calls, now_sec() - t0,
+                 decode_t0 > t0 ? decode_t0 - t0 : 0.0,
+                 first_token_t > t0 ? first_token_t - t0 : 0.0,
+                 &metrics_baseline);
 
     if (j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
@@ -12525,6 +12600,7 @@ static void *slot_worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    char origin[256];
     char *body;
     size_t body_len;
 } http_request;
@@ -12561,6 +12637,31 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static void copy_header_value(const char *h, size_t n, const char *name,
+                              char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && !strncasecmp(line, name, name_len) &&
+            line[name_len] == ':') {
+            const char *v = line + name_len + 1;
+            while (v < line + len && isspace((unsigned char)*v)) v++;
+            size_t value_len = (size_t)((line + len) - v);
+            if (value_len >= out_size) value_len = out_size - 1;
+            memcpy(out, v, value_len);
+            out[value_len] = '\0';
+            return;
+        }
+        if (p < end) p++;
+    }
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -12587,6 +12688,8 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+    copy_header_value(b.ptr, (size_t)hend, "Origin",
+                      r->origin, sizeof(r->origin));
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -12613,6 +12716,13 @@ typedef struct {
     server *srv;
     int fd;
 } client_arg;
+
+static bool restart_origin_allowed(const char *origin) {
+    if (!origin || !origin[0]) return true; /* non-browser local clients */
+    return !strncmp(origin, "http://127.0.0.1:", 17) ||
+           !strncmp(origin, "http://localhost:", 17) ||
+           !strncmp(origin, "http://[::1]:", 13);
+}
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens) {
@@ -12728,6 +12838,190 @@ static bool client_socket_disconnected(int fd) {
     }
 }
 
+/* ---- monitoring endpoints (web UI phase 1, see docs/WEB_UI_DESIGN.md) ---- */
+
+static int server_active_requests(server *s) {
+    int active = 0;
+    pthread_mutex_lock(&s->model_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        if (s->slots[i].busy) active++;
+    }
+    pthread_mutex_unlock(&s->model_mu);
+    return active;
+}
+
+static void append_prompt_stat_json(buf *b, const ds4_prompt_stat *p) {
+    buf_printf(b,
+        "{\"id\":%llu,\"ts\":%.3f,\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+        "\"prefill_s\":%.4f,\"ttft_s\":%.4f,\"gen_s\":%.4f,\"tok_s\":%.2f,"
+        "\"cache_read_tokens\":%d,\"cache_write_tokens\":%d,"
+        "\"expert_hits\":%llu,\"expert_misses\":%llu,"
+        "\"disk_bytes\":%llu,\"disk_s\":%.4f}",
+        (unsigned long long)p->id,
+        p->ts,
+        p->prompt_tokens,
+        p->completion_tokens,
+        p->prefill_s,
+        p->ttft_s,
+        p->gen_s,
+        p->tok_s,
+        p->cache_read_tokens,
+        p->cache_write_tokens,
+        (unsigned long long)p->expert_hits,
+        (unsigned long long)p->expert_misses,
+        (unsigned long long)p->disk_bytes,
+        p->disk_s);
+}
+
+static void send_health(server *s, int fd) {
+    ds4_metrics_snapshot m;
+    ds4_metrics_get_snapshot(&m);
+    const uint64_t lookups = m.expert_hits + m.expert_misses;
+    const double hit_rate = lookups ? (double)m.expert_hits / (double)lookups : 0.0;
+    const double avg_read_ms = m.disk_reads ?
+        m.disk_read_s / (double)m.disk_reads * 1000.0 : 0.0;
+    const double throughput_mbs = m.disk_read_s > 0.0 ?
+        (double)m.disk_bytes / m.disk_read_s / (1024.0 * 1024.0) : 0.0;
+    /* In CPU mode expert data comes from mmap page faults, which the
+     * backend hooks never see; fall back to the /proc/self/io rate. */
+    const double eff_mbs = m.disk_read_s > 0.0 ? throughput_mbs : m.proc_read_mbs;
+    buf b = {0};
+    buf_printf(&b,
+        "{\"status\":\"ok\",\"model\":\"%s\",\"uptime_s\":%.1f,"
+        "\"expert_cache\":{\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f},"
+        "\"disk\":{\"bytes_read\":%llu,\"reads\":%llu,\"total_read_s\":%.4f,"
+        "\"avg_read_ms\":%.3f,\"throughput_mbs\":%.2f,"
+        "\"proc_read_bytes\":%llu,\"proc_read_mbs\":%.2f}}\n",
+        server_model_id_from_engine(s->engine),
+        m.uptime_s,
+        (unsigned long long)m.expert_hits,
+        (unsigned long long)m.expert_misses,
+        hit_rate,
+        (unsigned long long)m.disk_bytes,
+        (unsigned long long)m.disk_reads,
+        m.disk_read_s,
+        avg_read_ms,
+        eff_mbs,
+        (unsigned long long)m.proc_read_bytes,
+        m.proc_read_mbs);
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
+static void send_profile(server *s, int fd) {
+    ds4_prompt_stat prompts[DS4_METRICS_PROMPT_CAPACITY];
+    const int n = ds4_metrics_get_prompts(prompts, DS4_METRICS_PROMPT_CAPACITY);
+    ds4_metrics_snapshot m;
+    ds4_metrics_get_snapshot(&m);
+    buf b = {0};
+    buf_printf(&b, "{\"seq\":%llu,\"prompts\":[", (unsigned long long)m.prompt_count);
+    for (int i = 0; i < n; i++) {
+        if (i) buf_putc(&b, ',');
+        append_prompt_stat_json(&b, &prompts[i]);
+    }
+    buf_puts(&b, "]}\n");
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
+/* One JSON snapshot per second over SSE, using the same send path as the
+ * inference streaming code (sse_headers + send_all) so the non-blocking
+ * socket conventions and CORS behavior match.  The loop ends when the client
+ * disconnects (send_all fails or a FIN is polled) or the server stops. */
+static void metrics_stream_main(server *s, int fd) {
+    if (!sse_headers(fd, s->enable_cors)) return;
+    while (!g_stop_requested) {
+        ds4_metrics_snapshot m;
+        ds4_metrics_get_snapshot(&m);
+        const uint64_t lookups = m.expert_hits + m.expert_misses;
+        const double hit_rate = lookups ? (double)m.expert_hits / (double)lookups : 0.0;
+        const double hook_mbs = m.disk_read_s > 0.0 ?
+            (double)m.disk_bytes / m.disk_read_s / (1024.0 * 1024.0) : 0.0;
+        /* CPU mode reads experts through mmap page faults, invisible to the
+         * backend hooks; use the /proc/self/io rate in that case. */
+        const double disk_mbs = m.disk_read_s > 0.0 ? hook_mbs : m.proc_read_mbs;
+        const uint64_t disk_bytes = m.disk_bytes ? m.disk_bytes : m.proc_read_bytes;
+        const double disk_avg_ms = m.disk_reads ?
+            m.disk_read_s / (double)m.disk_reads * 1000.0 : 0.0;
+        buf b = {0};
+        buf_printf(&b,
+            "data: {\"ts\":%.3f,\"active_requests\":%d,\"cache_hit_rate\":%.4f,"
+            "\"disk_mbs\":%.2f,\"disk_avg_ms\":%.3f,"
+            "\"expert_hits\":%llu,\"expert_misses\":%llu,\"disk_bytes\":%llu}\n\n",
+            m.uptime_s,
+            server_active_requests(s),
+            hit_rate,
+            disk_mbs,
+            disk_avg_ms,
+            (unsigned long long)m.expert_hits,
+            (unsigned long long)m.expert_misses,
+            (unsigned long long)disk_bytes);
+        const bool ok = send_all(fd, b.ptr, b.len);
+        buf_free(&b);
+        if (!ok) break;
+
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+        while (!g_stop_requested && nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        if (g_stop_requested || client_socket_disconnected(fd)) break;
+    }
+}
+
+/* Expert routing and cache snapshot. Cache decisions are deliberately
+ * grouped by expert id across layers: residency is an expert-cache property
+ * and the monitor must not imply that routing heat is a cache hit. */
+static void send_experts(server *s, int fd) {
+    const int layers = ds4_engine_layer_count(s->engine);
+    const int expert_count = ds4_engine_expert_count(s->engine);
+    if (layers <= 0 || expert_count <= 0) {
+        http_error(fd, s->enable_cors, 404, "model has no routed experts");
+        return;
+    }
+    const uint32_t n_expert = (uint32_t)expert_count;
+
+    buf b = {0};
+    buf_printf(&b, "{\"layers\":%d,\"experts_per_layer\":%u,\"heat\":[],\"top\":[],\"cache\":[",
+               layers, n_expert);
+    bool first = true;
+    uint64_t cache_hits[DS4_METRICS_EXPERT_CAPACITY];
+    uint64_t cache_misses[DS4_METRICS_EXPERT_CAPACITY];
+    const uint32_t cache_n = ds4_metrics_get_experts(
+        cache_hits, cache_misses, DS4_METRICS_EXPERT_CAPACITY);
+    first = true;
+    for (uint32_t e = 0; e < n_expert && e < cache_n; e++) {
+        if (cache_hits[e] == 0 && cache_misses[e] == 0) continue;
+        if (!first) buf_putc(&b, ',');
+        first = false;
+        buf_printf(&b, "[%u,%llu,%llu]", e,
+                   (unsigned long long)cache_hits[e],
+                   (unsigned long long)cache_misses[e]);
+    }
+    buf_puts(&b, "]}\n");
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
+/* Traversal-safe: serves only the literal web/index.html relative to the
+ * current working directory, read fresh on every request. */
+static void send_index_html(server *s, int fd) {
+    FILE *fp = fopen("web/index.html", "rb");
+    if (!fp) {
+        http_error(fd, s->enable_cors, 404, "not found");
+        return;
+    }
+    const size_t cap = 4u * 1024u * 1024u;
+    char *body = malloc(cap + 1);
+    if (!body) {
+        fclose(fp);
+        http_error(fd, s->enable_cors, 500, "out of memory");
+        return;
+    }
+    const size_t n = fread(body, 1, cap, fp);
+    fclose(fp);
+    body[n] = '\0';  /* http_response uses strlen; embedded NULs truncate */
+    http_response(fd, s->enable_cors, 200, "text/html", body);
+    free(body);
+}
+
 /* Mark first, then detach only work that no worker owns yet. No job mutex is
  * held while entering either server scheduler mutex. */
 static void server_cancel_job(server *s, job *j) {
@@ -12810,6 +13104,62 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
+        send_health(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/profile")) {
+        send_profile(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics/stream")) {
+        metrics_stream_main(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/experts")) {
+        send_experts(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/admin/restart")) {
+        if (!s->allow_web_restart) {
+            http_error(fd, s->enable_cors, 403,
+                       "web restart is available only on a loopback listener");
+        } else if (!restart_origin_allowed(hr.origin) ||
+                   strcmp(hr.body ? hr.body : "", "restart")) {
+            http_error(fd, s->enable_cors, 403, "restart confirmation rejected");
+        } else {
+            http_response(fd, s->enable_cors, 202, "application/json",
+                          "{\"status\":\"restarting\",\"arguments\":\"preserved\"}\n");
+            g_restart_requested = 1;
+            g_stop_requested = 1;
+            if (g_listen_fd >= 0) {
+                const int restart_lfd = (int)g_listen_fd;
+                g_listen_fd = -1;
+                shutdown(restart_lfd, SHUT_RDWR);
+                close(restart_lfd);
+            }
+        }
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/admin/restart")) {
+        http_response(fd, s->enable_cors, 200, "application/json",
+                      s->allow_web_restart ?
+                      "{\"available\":true}\n" :
+                      "{\"available\":false}\n");
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/") || !strcmp(hr.path, "/index.html"))) {
+        send_index_html(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -13305,6 +13655,14 @@ static void server_request_decode_stop(server *s) {
 }
 
 int main(int argc, char **argv) {
+    g_restart_argc = argc;
+    g_restart_argv = argv;
+    const ssize_t restart_exe_len =
+        readlink("/proc/self/exe", g_restart_exe, sizeof(g_restart_exe) - 1);
+    if (restart_exe_len > 0)
+        g_restart_exe[restart_exe_len] = '\0';
+    else
+        snprintf(g_restart_exe, sizeof(g_restart_exe), "%s", argv[0]);
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -13312,6 +13670,8 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    ds4_metrics_init();
 
     server_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
@@ -13383,6 +13743,9 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.allow_web_restart = !strcmp(cfg.host, "127.0.0.1") ||
+                          !strcmp(cfg.host, "localhost") ||
+                          !strcmp(cfg.host, "::1");
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -13415,6 +13778,42 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+    }
+
+    /* Match the CLI's startup behavior: pay one-time GPU pipeline creation
+     * and lazy model-tensor residency before accepting traffic. Otherwise the
+     * first request reports several seconds of model loading as "prefill".
+     * Warm every session because kernels/scratch can be session-local; the
+     * engine-shared weight cache makes sessions after the first inexpensive. */
+    if (cfg.engine.backend != DS4_BACKEND_CPU) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: warming %d GPU session%s before listen",
+                   slot_count, slot_count == 1 ? "" : "s");
+        for (int i = 0; i < slot_count; i++)
+            ds4_session_gpu_warmup(s.slots[i].session);
+        /* The lightweight hook above prepares kernels, but SSD streaming also
+         * maps most non-expert tensors lazily on the first real prefill. Run a
+         * disposable batch so that I/O is startup time, not user TTFT. */
+        ds4_tokens warm_tokens = {0};
+        ds4_tokenize_text(engine,
+            "Warm the inference engine and prepare every model layer for the first request. "
+            "This internal prompt is discarded before the server accepts traffic.",
+            &warm_tokens);
+        char warm_err[160] = {0};
+        if (warm_tokens.len > 0 &&
+            ds4_session_sync(s.slots[0].session, &warm_tokens,
+                             warm_err, sizeof(warm_err)) == 0) {
+            ds4_session_invalidate(s.slots[0].session);
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: GPU model residency warmup complete (%d tokens)",
+                       warm_tokens.len);
+        } else {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: GPU model residency warmup skipped: %s",
+                       warm_err[0] ? warm_err : "tokenization failed");
+        }
+        ds4_tokens_free(&warm_tokens);
+        ds4_metrics_reset_activity();
     }
 
     if (cfg.kv_disk_dir) {
@@ -13563,6 +13962,15 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
+    if (g_restart_requested) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: relaunching with %d preserved arguments",
+                   g_restart_argc);
+        execv(g_restart_exe, g_restart_argv);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: restart exec failed: %s",
+                   strerror(errno));
+        return 1;
+    }
     return 0;
 }
 #else

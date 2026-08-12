@@ -1,0 +1,1166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ds4 — chat + monitor</title>
+<style>
+:root {
+  --bg: #0b0e13;
+  --panel: #131820;
+  --panel2: #0f131a;
+  --border: #232b36;
+  --fg: #d3dae2;
+  --dim: #7d8791;
+  --green: #3fb950;
+  --orange: #d9832b;
+  --blue: #58a6ff;
+  --red: #e5534b;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* ---------- header ---------- */
+header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+header .logo { font-weight: 700; letter-spacing: 1px; color: var(--fg); }
+header .logo span { color: var(--blue); }
+#healthDot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 6px currentColor;
+  color: var(--red);
+  display: inline-block;
+}
+#healthDot.ok { background: var(--green); color: var(--green); }
+.tabs { display: flex; gap: 4px; margin-left: 8px; }
+.tabs button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--dim);
+  font: inherit;
+  padding: 4px 14px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.tabs button:hover { color: var(--fg); }
+.tabs button.active {
+  color: var(--fg);
+  background: var(--panel2);
+  border-color: var(--border);
+}
+#streamState { margin-left: auto; color: var(--dim); font-size: 12px; }
+#streamState.live { color: var(--green); }
+#streamState.down { color: var(--orange); }
+#restartBtn { padding: 5px 10px; font-size: 11px; }
+/* ---------- views ---------- */
+main { flex: 1 1 auto; min-height: 0; display: flex; }
+.view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; width: 100%; }
+.view.hidden { display: none; }
+/* ---------- chat ---------- */
+#msgList {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 18px 16px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.msg { max-width: 78%; }
+.msg.user { align-self: flex-end; }
+.msg.assistant { align-self: flex-start; max-width: 86%; }
+.msg .role {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--dim);
+  margin-bottom: 3px;
+}
+.msg.user .role { text-align: right; }
+.bubble {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg.user .bubble { background: #1a2230; color: #b9c4cf; }
+.bubble p { margin: 4px 0; }
+.bubble h3, .bubble h4, .bubble h5, .bubble h6 { margin: 10px 0 4px; color: var(--blue); font-size: 14px; }
+.bubble code {
+  background: #1c2330;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  font-size: 12px;
+  color: #e6b450;
+}
+.bubble pre {
+  background: #0d1219;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  margin: 6px 0;
+}
+.bubble pre code { background: none; border: none; padding: 0; color: var(--fg); }
+.statsRow { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.statsRow .badge {
+  font-size: 10px;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  background: var(--panel2);
+}
+.statsRow .badge b { color: var(--fg); font-weight: 600; }
+.typing { display: inline-flex; gap: 4px; padding: 4px 0; }
+.typing i {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--dim);
+  animation: blink 1.2s infinite;
+}
+.typing i:nth-child(2) { animation-delay: .2s; }
+.typing i:nth-child(3) { animation-delay: .4s; }
+@keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+.thinkingPanel {
+  margin: 0 0 8px; border: 1px solid rgba(210,153,34,.45);
+  border-radius: 6px; background: rgba(210,153,34,.07); overflow: hidden;
+}
+.thinkingPanel[open] { box-shadow: inset 3px 0 0 var(--orange); }
+.thinkingPanel summary {
+  cursor: pointer; padding: 6px 9px; color: var(--orange);
+  font-size: 11px; font-weight: 600; user-select: none;
+}
+.thinkingBody {
+  max-height: 260px; overflow: auto; padding: 0 10px 9px;
+  color: var(--dim); font-size: 12px;
+}
+/* live badge above composer */
+#liveBadge {
+  flex: 0 0 auto;
+  display: none;
+  gap: 14px;
+  padding: 4px 16px;
+  color: var(--dim);
+  font-size: 11px;
+  border-top: 1px solid var(--border);
+  background: var(--panel2);
+}
+#liveBadge.show { display: flex; }
+#liveBadge b { color: var(--green); font-weight: 600; }
+/* composer */
+#composerBar {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  align-items: flex-end;
+}
+#composer {
+  flex: 1 1 auto;
+  resize: none;
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  padding: 8px 10px;
+  min-height: 38px;
+  max-height: 160px;
+  outline: none;
+}
+#composer:focus { border-color: var(--blue); }
+.thinkControl {
+  display: flex; align-items: center; gap: 6px; height: 38px;
+  padding: 0 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel2); color: var(--dim); font-size: 11px;
+  cursor: pointer; white-space: nowrap;
+}
+.thinkControl:has(input:checked) { color: var(--orange); border-color: rgba(210,153,34,.65); }
+.thinkControl input { accent-color: var(--orange); }
+.btn {
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  padding: 8px 16px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.btn:hover { border-color: var(--blue); }
+.btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+.btn.primary:hover { background: #2b7cff; }
+.btn.danger { background: #7d2a26; border-color: #7d2a26; color: #fff; }
+.btn:disabled { opacity: .5; cursor: default; }
+/* ---------- monitor ---------- */
+#view-monitor { overflow-y: auto; padding: 12px; gap: 12px; }
+.monRow { display: flex; gap: 12px; flex: 0 0 auto; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+.card h2 {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--dim);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+/* stat tiles */
+#tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; width: 100%; }
+.tile .val { font-size: 20px; font-weight: 700; color: var(--fg); }
+.tile .sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
+.gauge {
+  height: 6px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  margin-top: 7px;
+  overflow: hidden;
+}
+.gauge > div { height: 100%; width: 0%; background: var(--green); transition: width .5s; }
+/* charts */
+#chartRow { align-items: stretch; }
+.chartCard { flex: 1 1 0; display: flex; flex-direction: column; }
+.chartCard canvas { width: 100%; height: 150px; display: block; }
+/* bottom row */
+#bottomRow { flex: 1 1 auto; min-height: 260px; align-items: stretch; }
+#profileCard { flex: 0 0 60%; display: flex; flex-direction: column; }
+#expertCard { flex: 1 1 auto; display: flex; flex-direction: column; }
+#profileTableWrap { overflow: auto; flex: 1 1 auto; }
+table { border-collapse: collapse; width: 100%; font-size: 11px; white-space: nowrap; }
+th, td { padding: 3px 8px; text-align: right; border-bottom: 1px solid var(--border); }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--dim); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+tr.row-new td { animation: rowFlash 2s ease-out; }
+@keyframes rowFlash { 0% { background: rgba(63,185,80,.35); } 100% { background: transparent; } }
+.emptyHint { color: var(--dim); padding: 14px 8px; font-size: 12px; }
+/* expert panel */
+#expertCounters { display: flex; gap: 12px; margin-bottom: 10px; }
+.bigCounter {
+  flex: 1 1 0;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  text-align: center;
+}
+.bigCounter .n { font-size: 24px; font-weight: 700; }
+.bigCounter .l { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); }
+#cntHits .n { color: var(--green); }
+#cntMiss .n { color: var(--orange); }
+#splitBar {
+  display: flex;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  margin-bottom: 4px;
+}
+#splitHits { background: var(--green); width: 50%; transition: width .4s; }
+#splitMiss { background: var(--orange); flex: 1 1 auto; }
+#splitLegend { font-size: 10px; color: var(--dim); margin-bottom: 10px; display: flex; justify-content: space-between; }
+#expertGridWrap { flex: 1 1 auto; min-height: 120px; position: relative; }
+#expertGrid { width: 100%; height: 100%; display: block; }
+#expertTip {
+  position: fixed; z-index: 20; display: none; pointer-events: none;
+  padding: 7px 9px; border: 1px solid var(--border); border-radius: 5px;
+  background: #0d1117; color: var(--fg); font-size: 11px;
+  line-height: 1.45; box-shadow: 0 4px 14px rgba(0,0,0,.4);
+}
+#expertGridNote {
+  position: absolute; inset: 0;
+  display: none;
+  align-items: center; justify-content: center;
+  color: var(--dim); font-size: 12px;
+  background: var(--panel);
+}
+#expertGridNote.show { display: flex; }
+@media (max-width: 900px) {
+  #chartRow, #bottomRow { flex-direction: column; }
+  #profileCard { flex: 1 1 auto; }
+  .msg, .msg.assistant { max-width: 96%; }
+}
+</style>
+</head>
+<body>
+<header>
+  <span id="healthDot" title="server health"></span>
+  <div class="logo">ds4<span>-server</span></div>
+  <nav class="tabs">
+    <button id="tabChat" class="active" data-view="chat">Chat</button>
+    <button id="tabMonitor" data-view="monitor">Monitor</button>
+  </nav>
+  <span id="streamState">metrics: connecting…</span>
+  <button id="restartBtn" class="btn danger" title="Restart with the current model and cache parameters">Restart server</button>
+</header>
+<main>
+  <!-- ================= CHAT ================= -->
+  <section id="view-chat" class="view">
+    <div id="msgList"></div>
+    <div id="liveBadge">
+      <span>tokens <b id="lbTokens">0</b></span>
+      <span>elapsed <b id="lbElapsed">0.0s</b></span>
+      <span>speed <b id="lbTokS">—</b></span>
+      <span id="lbFinal"></span>
+    </div>
+    <div id="composerBar">
+      <textarea id="composer" rows="1" placeholder="Message ds4… (Enter to send, Shift+Enter for newline)"></textarea>
+      <label class="thinkControl" title="Show model reasoning separately from the final answer"><input id="thinkingToggle" type="checkbox"> Thinking</label>
+      <button id="clearBtn" class="btn">Clear</button>
+      <button id="sendBtn" class="btn primary">Send</button>
+    </div>
+  </section>
+  <!-- ================= MONITOR ================= -->
+  <section id="view-monitor" class="view hidden">
+    <div class="monRow">
+      <div id="tiles">
+        <div class="card tile"><h2>Model</h2><div class="val" id="tModel">—</div><div class="sub" id="tStatus">status: —</div></div>
+        <div class="card tile"><h2>Uptime</h2><div class="val" id="tUptime">—</div><div class="sub">hh:mm:ss</div></div>
+        <div class="card tile"><h2>Expert cache</h2><div class="val" id="tHitRate">—</div><div class="sub" id="tCacheHM">hits — / misses —</div><div class="gauge"><div id="tGauge"></div></div></div>
+        <div class="card tile"><h2>Disk read</h2><div class="val" id="tDiskGB">—</div><div class="sub" id="tDiskReads">— reads</div></div>
+        <div class="card tile"><h2>Avg read</h2><div class="val" id="tAvgMs">—</div><div class="sub">ms per disk read</div></div>
+        <div class="card tile"><h2>Throughput</h2><div class="val" id="tMBs">—</div><div class="sub">MB/s disk</div></div>
+      </div>
+    </div>
+    <div class="monRow" id="chartRow">
+      <div class="card chartCard"><h2>Disk throughput (MB/s)</h2><canvas id="chMBs"></canvas></div>
+      <div class="card chartCard"><h2>Disk avg read latency (ms)</h2><canvas id="chMs"></canvas></div>
+      <div class="card chartCard"><h2>Cache hit rate (%)</h2><canvas id="chHit"></canvas></div>
+    </div>
+    <div class="monRow" id="bottomRow">
+      <div class="card" id="profileCard">
+        <h2>Per-prompt profile</h2>
+        <div id="profileTableWrap">
+          <table>
+            <thead><tr>
+              <th>time</th><th>p-tok</th><th>c-tok</th><th>prefill s</th><th>ttft s</th>
+              <th>gen s</th><th>tok/s</th><th>kv r/w</th><th>exp h/m</th><th>disk MB</th><th>disk s</th>
+            </tr></thead>
+            <tbody id="profileBody"></tbody>
+          </table>
+          <div class="emptyHint" id="profileEmpty">no completed prompts yet</div>
+        </div>
+      </div>
+      <div class="card" id="expertCard">
+        <h2>Expert cache by expert ID</h2>
+        <div id="expertCounters">
+          <div class="bigCounter" id="cntHits"><div class="n">0</div><div class="l">VRAM hits</div></div>
+          <div class="bigCounter" id="cntMiss"><div class="n">0</div><div class="l">disk fetches</div></div>
+        </div>
+        <div id="splitBar"><div id="splitHits"></div><div id="splitMiss"></div></div>
+        <div id="splitLegend"><span style="color:var(--green)">■ cache hit</span><span id="splitPct">—</span><span style="color:var(--orange)">■ cache miss</span></div>
+        <div id="expertGridWrap">
+          <canvas id="expertGrid"></canvas>
+          <div id="expertGridNote">waiting for per-expert cache activity</div>
+        </div>
+        <div id="expertTip"></div>
+      </div>
+    </div>
+  </section>
+</main>
+<script type="module">
+'use strict';
+
+/* ================= helpers ================= */
+const $ = (id) => document.getElementById(id);
+
+function fmtNum(v) {
+  if (!isFinite(v) || v === null || v === undefined) return '0';
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(2) + 'G';
+  if (a >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (a >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 10) return v.toFixed(1);
+  return v.toFixed(2);
+}
+function fmtInt(v) { return Math.round(v).toLocaleString('en-US'); }
+function fmtFixed(v, d) { return (typeof v === 'number' && isFinite(v)) ? v.toFixed(d) : '—'; }
+function fmtUptime(s) {
+  s = Math.max(0, Math.floor(s || 0));
+  const h = String(Math.floor(s / 3600)).padStart(2, '0');
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const sec = String(s % 60).padStart(2, '0');
+  return h + ':' + m + ':' + sec;
+}
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  if (isNaN(d)) return '—';
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, '0')).join(':');
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+/* ================= controlled server restart ================= */
+const restartBtn = $('restartBtn');
+async function detectRestartSupport() {
+  try {
+    const r = await fetch('/admin/restart', { cache: 'no-store' });
+    if (!r.ok) throw new Error();
+    const status = await r.json();
+    if (!status.available) throw new Error();
+  } catch (_) {
+    restartBtn.disabled = true;
+    restartBtn.textContent = 'Restart unavailable';
+    restartBtn.title = 'Stop and launch the newly compiled server once to enable web restart';
+  }
+}
+detectRestartSupport();
+restartBtn.addEventListener('click', async () => {
+  if (!confirm('Restart ds4-server now? Active generations will stop. Current launch parameters will be preserved.')) return;
+  restartBtn.disabled = true;
+  restartBtn.textContent = 'Restarting…';
+  $('streamState').textContent = 'server: restarting';
+  try {
+    const r = await fetch('/admin/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'restart'
+    });
+    if (!r.ok) {
+      if (r.status === 404) throw new Error('the running server is an older binary; stop it and launch ./run_ds4_cuda_server.sh once');
+      throw new Error((await r.text()) || ('HTTP ' + r.status));
+    }
+    const deadline = Date.now() + 180000;
+    let sawOffline = false;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        const health = await fetch('/health', { cache: 'no-store' });
+        if (health.ok && sawOffline) { location.reload(); return; }
+      } catch (_) { sawOffline = true; }
+    }
+    throw new Error('restart timed out');
+  } catch (err) {
+    restartBtn.disabled = false;
+    restartBtn.textContent = 'Restart server';
+    $('streamState').textContent = 'restart failed';
+    alert('Server restart failed: ' + err.message);
+  }
+});
+
+/* ================= tabs ================= */
+const tabBtns = { chat: $('tabChat'), monitor: $('tabMonitor') };
+const views = { chat: $('view-chat'), monitor: $('view-monitor') };
+for (const name of Object.keys(tabBtns)) {
+  tabBtns[name].addEventListener('click', () => {
+    for (const k of Object.keys(tabBtns)) {
+      tabBtns[k].classList.toggle('active', k === name);
+      views[k].classList.toggle('hidden', k !== name);
+    }
+    if (name === 'monitor') requestAnimationFrame(() => {
+      charts.forEach(c => c.draw());
+      drawExperts();
+    });
+  });
+}
+
+/* ================= minimal markdown (XSS-safe, DOM-built) ================= */
+function mdInline(parent, text) {
+  let i = 0, buf = '';
+  const flush = () => { if (buf) { parent.appendChild(document.createTextNode(buf)); buf = ''; } };
+  while (i < text.length) {
+    if (text[i] === '`') {
+      const end = text.indexOf('`', i + 1);
+      if (end !== -1) {
+        flush();
+        parent.appendChild(el('code', null, text.slice(i + 1, end)));
+        i = end + 1;
+        continue;
+      }
+    }
+    if (text[i] === '*' && text[i + 1] === '*') {
+      const end = text.indexOf('**', i + 2);
+      if (end !== -1 && end > i + 2) {
+        flush();
+        const b = el('strong');
+        mdInline(b, text.slice(i + 2, end));
+        parent.appendChild(b);
+        i = end + 2;
+        continue;
+      }
+    }
+    buf += text[i];
+    i++;
+  }
+  flush();
+}
+
+function mdRender(container, text) {
+  container.textContent = '';
+  const lines = String(text).split('\n');
+  let para = [];
+  let i = 0;
+  const flushPara = () => {
+    if (!para.length) return;
+    const p = el('p');
+    mdInline(p, para.join('\n'));
+    container.appendChild(p);
+    para = [];
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trimStart().startsWith('```')) {
+      flushPara();
+      const buf = [];
+      i++;
+      while (i < lines.length && !lines[i].trimStart().startsWith('```')) { buf.push(lines[i]); i++; }
+      i++; /* skip closing fence (or run off the end) */
+      const pre = el('pre');
+      pre.appendChild(el('code', null, buf.join('\n')));
+      container.appendChild(pre);
+      continue;
+    }
+    let hLevel = 0;
+    while (hLevel < line.length && line[hLevel] === '#') hLevel++;
+    if (hLevel > 0 && hLevel <= 6 && line[hLevel] === ' ') {
+      flushPara();
+      const h = el('h' + Math.min(6, hLevel + 2)); /* keep headings small */
+      mdInline(h, line.slice(hLevel + 1));
+      container.appendChild(h);
+      i++;
+      continue;
+    }
+    if (line.trim() === '') { flushPara(); i++; continue; }
+    para.push(line);
+    i++;
+  }
+  flushPara();
+}
+
+/* ================= chat ================= */
+const msgList = $('msgList');
+const composer = $('composer');
+const thinkingToggle = $('thinkingToggle');
+const sendBtn = $('sendBtn');
+const clearBtn = $('clearBtn');
+const liveBadge = $('liveBadge');
+const lbTokens = $('lbTokens'), lbElapsed = $('lbElapsed'), lbTokS = $('lbTokS'), lbFinal = $('lbFinal');
+
+const chat = { msgs: [], ctrl: null, sending: false };
+thinkingToggle.checked = localStorage.getItem('ds4-thinking') === '1';
+thinkingToggle.addEventListener('change', () => {
+  localStorage.setItem('ds4-thinking', thinkingToggle.checked ? '1' : '0');
+});
+
+function scrollBottom() {
+  const nearBottom = msgList.scrollHeight - msgList.scrollTop - msgList.clientHeight < 160;
+  if (nearBottom) msgList.scrollTop = msgList.scrollHeight;
+}
+
+function addUserMsg(text) {
+  const wrap = el('div', 'msg user');
+  wrap.appendChild(el('div', 'role', 'you'));
+  const bubble = el('div', 'bubble');
+  bubble.textContent = text;
+  wrap.appendChild(bubble);
+  msgList.appendChild(wrap);
+  msgList.scrollTop = msgList.scrollHeight;
+}
+
+function addAssistantShell() {
+  const wrap = el('div', 'msg assistant');
+  wrap.appendChild(el('div', 'role', 'ds4'));
+  const bubble = el('div', 'bubble');
+  const thinkingPanel = el('details', 'thinkingPanel');
+  const thinkingSummary = el('summary', null, 'Thinking…');
+  const thinkingBody = el('div', 'thinkingBody');
+  thinkingPanel.appendChild(thinkingSummary);
+  thinkingPanel.appendChild(thinkingBody);
+  thinkingPanel.style.display = 'none';
+  bubble.appendChild(thinkingPanel);
+  const typing = el('span', 'typing');
+  typing.appendChild(el('i')); typing.appendChild(el('i')); typing.appendChild(el('i'));
+  bubble.appendChild(typing);
+  const statsRow = el('div', 'statsRow');
+  statsRow.style.display = 'none';
+  wrap.appendChild(bubble);
+  wrap.appendChild(statsRow);
+  msgList.appendChild(wrap);
+  msgList.scrollTop = msgList.scrollHeight;
+  return { bubble, typing, statsRow, thinkingPanel, thinkingSummary, thinkingBody };
+}
+
+function badge(label, value) {
+  const b = el('span', 'badge');
+  b.appendChild(document.createTextNode(label + ' '));
+  b.appendChild(el('b', null, String(value)));
+  return b;
+}
+
+function showStatsRow(row, s) {
+  if (!s || typeof s !== 'object') return;
+  const items = [];
+  if (typeof s.tok_s === 'number') items.push(['tok/s', s.tok_s.toFixed(1)]);
+  if (typeof s.ttft_s === 'number') items.push(['ttft', s.ttft_s.toFixed(2) + 's']);
+  if (typeof s.prompt_tokens === 'number') items.push(['prompt', fmtInt(s.prompt_tokens)]);
+  if (typeof s.completion_tokens === 'number') items.push(['completion', fmtInt(s.completion_tokens)]);
+  if (typeof s.cache_read_tokens === 'number') items.push(['cache-read', fmtInt(s.cache_read_tokens)]);
+  if (!items.length) return;
+  row.textContent = '';
+  for (const [k, v] of items) row.appendChild(badge(k, v));
+  row.style.display = 'flex';
+}
+
+function setSending(on) {
+  chat.sending = on;
+  sendBtn.textContent = on ? 'Stop' : 'Send';
+  sendBtn.classList.toggle('danger', on);
+  sendBtn.classList.toggle('primary', !on);
+  composer.disabled = false;
+  thinkingToggle.disabled = on;
+}
+
+function liveReset() {
+  lbTokens.textContent = '0';
+  lbElapsed.textContent = '0.0s';
+  lbTokS.textContent = '—';
+  lbFinal.textContent = '';
+  liveBadge.classList.add('show');
+}
+function liveDone(ttftS, tokS) {
+  lbFinal.textContent = '';
+  lbFinal.appendChild(badge('TTFT', ttftS != null ? ttftS.toFixed(2) + 's' : '—'));
+  lbFinal.appendChild(badge('final tok/s', tokS != null ? tokS.toFixed(1) : '—'));
+}
+
+async function sendChat() {
+  const text = composer.value.trim();
+  if (!text || chat.sending) return;
+  composer.value = '';
+  composer.style.height = 'auto';
+  chat.msgs.push({ role: 'user', content: text });
+  addUserMsg(text);
+
+  setSending(true);
+  liveReset();
+  chat.ctrl = new AbortController();
+  const shell = addAssistantShell();
+  const thinkingEnabled = thinkingToggle.checked;
+  const acc = { content: '', reasoning: '' };
+  const t0 = performance.now();
+  let tFirst = 0, chunks = 0, ds4Stats = null, usage = null, sawDone = false;
+
+  const renderAnswer = () => {
+    const children = [...shell.bubble.childNodes].filter(n => n === shell.thinkingPanel);
+    shell.bubble.textContent = '';
+    for (const child of children) shell.bubble.appendChild(child);
+    if (acc.content) {
+      const answer = el('div', 'answerBody');
+      mdRender(answer, acc.content);
+      shell.bubble.appendChild(answer);
+    }
+    scrollBottom();
+  };
+  const renderReasoning = () => {
+    shell.thinkingPanel.style.display = 'block';
+    shell.thinkingPanel.open = true;
+    mdRender(shell.thinkingBody, acc.reasoning);
+    shell.thinkingBody.scrollTop = shell.thinkingBody.scrollHeight;
+    scrollBottom();
+  };
+
+  try {
+    const res = await fetch(location.origin + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'ds4',
+        messages: chat.msgs.map(m => {
+          const out = { role: m.role, content: m.content };
+          if (m.reasoning_content) out.reasoning_content = m.reasoning_content;
+          return out;
+        }),
+        reasoning_effort: thinkingEnabled ? 'high' : 'none',
+        stream: true,
+        stream_options: { include_usage: true }
+      }),
+      signal: chat.ctrl.signal
+    });
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let cut;
+      while ((cut = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          if (payload === '[DONE]') { sawDone = true; continue; }
+          let j;
+          try { j = JSON.parse(payload); } catch (e) { continue; }
+          if (j && typeof j === 'object' && j.ds4) { ds4Stats = j.ds4; continue; }
+          if (j && j.usage) usage = j.usage;
+          const delta = j && j.choices && j.choices[0] && j.choices[0].delta;
+          if (delta && typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+            if (!tFirst) { tFirst = performance.now(); shell.typing.remove(); }
+            chunks++;
+            acc.reasoning += delta.reasoning_content;
+            renderReasoning();
+            const elS = (performance.now() - t0) / 1000;
+            lbTokens.textContent = String(chunks);
+            lbElapsed.textContent = elS.toFixed(1) + 's';
+            lbTokS.textContent = (chunks / Math.max(elS, 0.001)).toFixed(1) + ' tok/s';
+          }
+          if (delta && typeof delta.content === 'string' && delta.content) {
+            if (!tFirst) { tFirst = performance.now(); shell.typing.remove(); }
+            chunks++;
+            acc.content += delta.content;
+            renderAnswer();
+            const elS = (performance.now() - t0) / 1000;
+            lbTokens.textContent = String(chunks);
+            lbElapsed.textContent = elS.toFixed(1) + 's';
+            lbTokS.textContent = (chunks / Math.max(elS, 0.001)).toFixed(1) + ' tok/s';
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      if (!acc.content) { shell.typing.remove(); acc.content = '*stopped*'; }
+      renderAnswer();
+    } else {
+      shell.typing.remove();
+      shell.bubble.textContent = '';
+      shell.bubble.appendChild(el('p', null, '⚠ request failed: ' + (err && err.message ? err.message : String(err))));
+    }
+  }
+
+  if (!acc.content && !shell.bubble.textContent) {
+    shell.typing.remove();
+    shell.bubble.textContent = '(empty response)';
+  } else if (acc.content && shell.typing.parentNode) {
+    shell.typing.remove();
+    renderAnswer();
+  }
+
+  if (acc.reasoning) {
+    shell.thinkingSummary.textContent = 'Thinking';
+    shell.thinkingPanel.open = false;
+  }
+
+  const totalS = (performance.now() - t0) / 1000;
+  const ttftS = ds4Stats && typeof ds4Stats.ttft_s === 'number' ? ds4Stats.ttft_s
+    : (tFirst ? (tFirst - t0) / 1000 : null);
+  const finalTokS = ds4Stats && typeof ds4Stats.tok_s === 'number' ? ds4Stats.tok_s
+    : (chunks ? chunks / Math.max(totalS, 0.001) : null);
+  liveDone(ttftS, finalTokS);
+  showStatsRow(shell.statsRow, ds4Stats || (usage ? {
+    prompt_tokens: usage.prompt_tokens,
+    completion_tokens: usage.completion_tokens
+  } : null));
+
+  chat.msgs.push({ role: 'assistant', content: acc.content, reasoning_content: acc.reasoning });
+  setSending(false);
+  void sawDone;
+}
+
+sendBtn.addEventListener('click', () => {
+  if (chat.sending) { if (chat.ctrl) chat.ctrl.abort(); return; }
+  sendChat().catch(() => setSending(false));
+});
+clearBtn.addEventListener('click', () => {
+  if (chat.sending && chat.ctrl) chat.ctrl.abort();
+  chat.msgs = [];
+  msgList.textContent = '';
+  liveBadge.classList.remove('show');
+});
+composer.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (chat.sending) return;
+    sendChat().catch(() => setSending(false));
+  }
+});
+composer.addEventListener('input', () => {
+  composer.style.height = 'auto';
+  composer.style.height = Math.min(composer.scrollHeight, 160) + 'px';
+});
+
+/* ================= canvas line charts ================= */
+const CAP = 120;
+function makeChart(canvas, opts) {
+  const o = Object.assign({ color: '#58a6ff', unit: '', pct: false }, opts);
+  const samples = [];
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (!W || !H) return;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const padL = 42, padR = 58, padT = 8, padB = 16;
+    const iw = W - padL - padR, ih = H - padT - padB;
+    let max = o.pct ? 100 : 0;
+    if (!o.pct) {
+      for (const v of samples) if (v > max) max = v;
+      max = max > 0 ? max * 1.15 : 1;
+    }
+    ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = '#232b36';
+    ctx.fillStyle = '#7d8791';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (let g = 0; g <= 4; g++) {
+      const y = padT + ih - (ih * g) / 4;
+      ctx.beginPath();
+      ctx.moveTo(padL, y + 0.5);
+      ctx.lineTo(padL + iw, y + 0.5);
+      ctx.stroke();
+      ctx.fillText(fmtNum((max * g) / 4), padL - 6, y);
+    }
+    if (samples.length > 1) {
+      ctx.strokeStyle = o.color;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      const n = samples.length;
+      for (let i = 0; i < n; i++) {
+        const x = padL + (iw * i) / (CAP - 1);
+        const y = padT + ih - ih * Math.min(samples[i] / max, 1);
+        if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+      const lv = samples[n - 1];
+      const ly = Math.max(padT + 6, Math.min(H - padB, padT + ih - ih * Math.min(lv / max, 1)));
+      ctx.fillStyle = o.color;
+      ctx.textAlign = 'left';
+      ctx.fillText(fmtNum(lv) + o.unit, padL + iw + 6, ly);
+    } else {
+      ctx.fillStyle = '#7d8791';
+      ctx.textAlign = 'center';
+      ctx.fillText('waiting for data…', padL + iw / 2, padT + ih / 2);
+    }
+  }
+  return {
+    push(v) {
+      samples.push(typeof v === 'number' && isFinite(v) ? v : 0);
+      if (samples.length > CAP) samples.shift();
+      draw();
+    },
+    draw
+  };
+}
+const charts = [
+  makeChart($('chMBs'), { color: '#58a6ff', unit: ' MB/s' }),
+  makeChart($('chMs'), { color: '#d9832b', unit: ' ms' }),
+  makeChart($('chHit'), { color: '#3fb950', unit: '%', pct: true })
+];
+window.addEventListener('resize', () => { charts.forEach(c => c.draw()); drawExperts(); });
+
+/* ================= /metrics/stream (SSE, 1 Hz) ================= */
+const streamState = $('streamState');
+const BACKOFF = [1000, 2000, 5000, 10000];
+let backoffIdx = 0;
+let metricsES = null;
+
+function setStreamState(mode, retryS) {
+  streamState.classList.remove('live', 'down');
+  if (mode === 'live') {
+    streamState.classList.add('live');
+    streamState.textContent = 'metrics: live';
+  } else {
+    streamState.classList.add('down');
+    streamState.textContent = 'metrics: disconnected' + (retryS ? ' — retrying in ' + retryS + 's' : '');
+  }
+}
+
+function connectMetrics() {
+  try {
+    metricsES = new EventSource('/metrics/stream');
+  } catch (e) {
+    scheduleReconnect();
+    return;
+  }
+  metricsES.onopen = () => { backoffIdx = 0; setStreamState('live'); };
+  metricsES.onmessage = (ev) => {
+    let j;
+    try { j = JSON.parse(ev.data); } catch (e) { return; }
+    if (!j || typeof j !== 'object') return;
+    charts[0].push(j.disk_mbs || 0);
+    charts[1].push(j.disk_avg_ms || 0);
+    charts[2].push((j.cache_hit_rate || 0) * (j.cache_hit_rate <= 1 ? 100 : 1));
+  };
+  metricsES.onerror = () => {
+    try { metricsES.close(); } catch (e) { /* ignore */ }
+    scheduleReconnect();
+  };
+}
+function scheduleReconnect() {
+  const wait = BACKOFF[Math.min(backoffIdx, BACKOFF.length - 1)];
+  backoffIdx++;
+  setStreamState('down', Math.round(wait / 1000));
+  setTimeout(connectMetrics, wait);
+}
+connectMetrics();
+
+/* ================= /health poll (5 s) + status dot ================= */
+const healthDot = $('healthDot');
+let lastHealthOk = 0;
+
+async function pollHealth() {
+  let j = null;
+  try {
+    const r = await fetch('/health');
+    if (r.ok) j = await r.json();
+  } catch (e) { /* server may be down */ }
+  if (!j || typeof j !== 'object') return;
+  lastHealthOk = Date.now();
+  $('tModel').textContent = j.model || '—';
+  $('tStatus').textContent = 'status: ' + (j.status || '—');
+  $('tUptime').textContent = fmtUptime(j.uptime_s);
+  const ec = j.expert_cache || {};
+  const hr = typeof ec.hit_rate === 'number' ? ec.hit_rate : 0;
+  const pct = hr <= 1 ? hr * 100 : hr;
+  $('tHitRate').textContent = pct.toFixed(1) + '%';
+  $('tCacheHM').textContent = 'hits ' + fmtInt(ec.hits || 0) + ' / misses ' + fmtInt(ec.misses || 0);
+  $('tGauge').style.width = Math.min(100, Math.max(0, pct)) + '%';
+  const dk = j.disk || {};
+  $('tDiskGB').textContent = fmtNum((dk.bytes_read || 0) / (1 << 30)) + ' GB';
+  $('tDiskReads').textContent = fmtInt(dk.reads || 0) + ' reads';
+  $('tAvgMs').textContent = fmtFixed(dk.avg_read_ms, 2);
+  $('tMBs').textContent = fmtFixed(dk.throughput_mbs, 1);
+}
+setInterval(() => { pollHealth().catch(() => {}); }, 5000);
+pollHealth().catch(() => {});
+setInterval(() => { healthDot.classList.toggle('ok', Date.now() - lastHealthOk < 9000); }, 1000);
+
+/* ================= /profile poll (2 s) ================= */
+const profileBody = $('profileBody');
+const profileEmpty = $('profileEmpty');
+const knownIds = new Set();
+let prevMaxId = null;
+const counters = {
+  hits: { el: $('cntHits').querySelector('.n'), shown: 0, target: 0 },
+  miss: { el: $('cntMiss').querySelector('.n'), shown: 0, target: 0 }
+};
+
+function updateSplit(hits, misses) {
+  const tot = hits + misses;
+  const pctH = tot > 0 ? (hits / tot) * 100 : 50;
+  $('splitHits').style.width = pctH + '%';
+  $('splitPct').textContent = tot > 0
+    ? pctH.toFixed(0) + '% VRAM / ' + (100 - pctH).toFixed(0) + '% disk'
+    : 'no data';
+}
+
+async function pollProfile() {
+  let j = null;
+  try {
+    const r = await fetch('/profile');
+    if (r.ok) j = await r.json();
+  } catch (e) { return; }
+  if (!j || typeof j !== 'object') return;
+  const prompts = Array.isArray(j.prompts) ? j.prompts : [];
+  profileEmpty.style.display = prompts.length ? 'none' : 'block';
+
+  const newestFirst = [...prompts].sort((a, b) => (b.id || 0) - (a.id || 0));
+  profileBody.textContent = '';
+  for (const p of newestFirst) {
+    const tr = el('tr');
+    if (p.id !== undefined && !knownIds.has(p.id) && prevMaxId !== null) tr.className = 'row-new';
+    if (p.id !== undefined) knownIds.add(p.id);
+    const cells = [
+      fmtClock(p.ts),
+      fmtInt(p.prompt_tokens || 0),
+      fmtInt(p.completion_tokens || 0),
+      fmtFixed(p.prefill_s, 2),
+      fmtFixed(p.ttft_s, 2),
+      fmtFixed(p.gen_s, 2),
+      fmtFixed(p.tok_s, 1),
+      fmtInt(p.cache_read_tokens || 0) + '/' + fmtInt(p.cache_write_tokens || 0),
+      fmtInt(p.expert_hits || 0) + '/' + fmtInt(p.expert_misses || 0),
+      fmtNum((p.disk_bytes || 0) / (1 << 20)),
+      fmtFixed(p.disk_s, 2)
+    ];
+    for (const c of cells) tr.appendChild(el('td', null, c));
+    profileBody.appendChild(tr);
+  }
+
+  /* expert counters: delta of new prompts between polls */
+  let maxId = null, dH = 0, dM = 0, newest = null;
+  for (const p of prompts) {
+    if (typeof p.id !== 'number') continue;
+    if (maxId === null || p.id > maxId) { maxId = p.id; newest = p; }
+    if (prevMaxId !== null && p.id > prevMaxId) {
+      dH += p.expert_hits || 0;
+      dM += p.expert_misses || 0;
+    }
+  }
+  if (maxId !== null) {
+    if (prevMaxId !== null) {
+      counters.hits.target += dH;
+      counters.miss.target += dM;
+    }
+    if (newest && (prevMaxId === null || maxId > prevMaxId)) {
+      updateSplit(newest.expert_hits || 0, newest.expert_misses || 0);
+    }
+    prevMaxId = maxId;
+  }
+}
+setInterval(() => { pollProfile().catch(() => {}); }, 2000);
+pollProfile().catch(() => {});
+
+/* animated counters */
+setInterval(() => {
+  for (const k of ['hits', 'miss']) {
+    const c = counters[k];
+    const diff = c.target - c.shown;
+    if (Math.abs(diff) < 1) c.shown = c.target;
+    else c.shown += diff * 0.18;
+    c.el.textContent = fmtInt(c.shown);
+  }
+}, 80);
+
+/* ================= /experts grid (optional endpoint) ================= */
+const expertCanvas = $('expertGrid');
+const expertNote = $('expertGridNote');
+const expertTip = $('expertTip');
+let expertsAvail = false;
+let expertData = null;
+const expertCache = new Map(); /* expert id -> { hits, misses } */
+let expertLayout = null;
+
+function setExpertsAvail(ok, message = 'waiting for per-expert cache activity') {
+  expertsAvail = ok;
+  if (!ok) expertNote.textContent = message;
+  expertNote.classList.toggle('show', !ok);
+  expertCanvas.style.visibility = ok ? 'visible' : 'hidden';
+}
+setExpertsAvail(false);
+
+async function pollExperts() {
+  try {
+    const r = await fetch('/experts');
+    if (!r.ok) { if (r.status === 404) setExpertsAvail(false); return; }
+    const j = await r.json();
+    if (!j || typeof j !== 'object' || !j.experts_per_layer) return;
+    expertData = j;
+    if (!Array.isArray(j.cache)) {
+      setExpertsAvail(false, 'server restart required for per-expert cache telemetry');
+      return;
+    }
+    expertCache.clear();
+    for (const rec of j.cache) {
+      if (!Array.isArray(rec) || rec.length < 3) continue;
+      expertCache.set(rec[0], { hits: rec[1], misses: rec[2] });
+    }
+    setExpertsAvail(expertCache.size > 0);
+    drawExperts();
+  } catch (e) {
+    /* endpoint absent or network error — keep counters-only mode */
+  }
+}
+setInterval(() => { pollExperts().catch(() => {}); }, 2500);
+pollExperts().catch(() => {});
+
+function drawExperts() {
+  if (!expertsAvail || !expertData) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = expertCanvas.clientWidth, H = expertCanvas.clientHeight;
+  if (!W || !H) return;
+  if (expertCanvas.width !== Math.round(W * dpr) || expertCanvas.height !== Math.round(H * dpr)) {
+    expertCanvas.width = Math.round(W * dpr);
+    expertCanvas.height = Math.round(H * dpr);
+  }
+  const ctx = expertCanvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const count = expertData.experts_per_layer;
+  const cols = Math.max(8, Math.min(count, Math.floor(W / 20)));
+  const rows = Math.ceil(count / cols);
+  const cw = W / cols, ch = H / rows;
+  const gap = Math.min(3, Math.max(1, Math.min(cw, ch) * .12));
+  let maxActivity = 1;
+  for (const v of expertCache.values()) maxActivity = Math.max(maxActivity, v.hits + v.misses);
+  expertLayout = { cols, rows, cw, ch, count };
+  for (let e = 0; e < count; e++) {
+    const v = expertCache.get(e) || { hits: 0, misses: 0 };
+    const total = v.hits + v.misses;
+    const hitRate = total ? v.hits / total : 0;
+    const activity = total ? .35 + .65 * Math.sqrt(total / maxActivity) : 0;
+    const x = (e % cols) * cw, y = Math.floor(e / cols) * ch;
+    if (!total) ctx.fillStyle = '#21262d';
+    else {
+      const missRate = 1 - hitRate;
+      const r = (35 + 205 * missRate) * activity;
+      const g = (65 + 135 * hitRate) * activity;
+      const b = (45 + 20 * hitRate) * activity;
+      ctx.fillStyle = `rgb(${r | 0},${g | 0},${b | 0})`;
+    }
+    ctx.fillRect(x + gap / 2, y + gap / 2,
+                 Math.max(1, cw - gap), Math.max(1, ch - gap));
+    if (cw >= 25 && ch >= 15) {
+      ctx.fillStyle = total ? '#fff' : '#768390';
+      ctx.font = '9px ui-monospace, monospace';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(e), x + cw / 2, y + ch / 2);
+    }
+  }
+}
+expertCanvas.addEventListener('mousemove', (ev) => {
+  if (!expertLayout) return;
+  const r = expertCanvas.getBoundingClientRect();
+  const col = Math.floor((ev.clientX - r.left) / expertLayout.cw);
+  const row = Math.floor((ev.clientY - r.top) / expertLayout.ch);
+  const e = row * expertLayout.cols + col;
+  if (e < 0 || e >= expertLayout.count) { expertTip.style.display = 'none'; return; }
+  const v = expertCache.get(e) || { hits: 0, misses: 0 };
+  const total = v.hits + v.misses;
+  const pct = total ? (v.hits / total * 100).toFixed(1) + '%' : 'no accesses';
+  expertTip.innerHTML = `<b>Expert ${e}</b><br><span style="color:var(--green)">hits ${fmtInt(v.hits)}</span> · <span style="color:var(--orange)">misses ${fmtInt(v.misses)}</span><br>hit rate ${pct}`;
+  expertTip.style.left = (ev.clientX + 12) + 'px';
+  expertTip.style.top = (ev.clientY + 12) + 'px';
+  expertTip.style.display = 'block';
+});
+expertCanvas.addEventListener('mouseleave', () => { expertTip.style.display = 'none'; });
+window.addEventListener('resize', drawExperts);
+</script>
+</body>
+</html>
