@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_metrics.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -10138,7 +10139,38 @@ static void trace_finish(
         const char *parsed_content,
         const char *parsed_reasoning,
         const tool_calls *parsed_calls,
-        double elapsed) {
+        double elapsed,
+        double prefill_s,
+        double ttft_s,
+        const ds4_metrics_snapshot *baseline) {
+    /* Metrics recording must run even when file tracing is disabled, so it
+     * happens before the trace early-return.  Only request data in scope here
+     * is used; anything else stays 0. */
+    ds4_prompt_stat stat = {0};
+    stat.id = id;
+    stat.ts = (double)time(NULL);
+    stat.prompt_tokens = r->prompt.len;
+    stat.completion_tokens = completion;
+    stat.prefill_s = prefill_s;
+    stat.ttft_s = ttft_s;
+    stat.gen_s = elapsed > prefill_s ? elapsed - prefill_s : 0.0;
+    stat.tok_s = stat.gen_s > 0.0 && completion > 0 ?
+        (double)completion / stat.gen_s : 0.0;
+    stat.cache_read_tokens = r->cache_read_tokens;
+    stat.cache_write_tokens = r->cache_write_tokens;
+    if (baseline) {
+        ds4_metrics_snapshot now;
+        ds4_metrics_get_snapshot(&now);
+        stat.expert_hits = now.expert_hits - baseline->expert_hits;
+        stat.expert_misses = now.expert_misses - baseline->expert_misses;
+        stat.disk_bytes = now.disk_bytes - baseline->disk_bytes;
+        stat.disk_s = now.disk_read_s - baseline->disk_read_s;
+        /* CPU mode streams experts via mmap page faults, invisible to the
+         * backend hooks; fall back to /proc/self/io deltas. */
+        if (stat.disk_bytes == 0 && now.proc_read_bytes >= baseline->proc_read_bytes)
+            stat.disk_bytes = now.proc_read_bytes - baseline->proc_read_bytes;
+    }
+    ds4_metrics_record_prompt(&stat);
     if (!s->trace || !id) return;
 
     pthread_mutex_lock(&s->trace_mu);
@@ -11341,6 +11373,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
+    ds4_metrics_snapshot metrics_baseline;
+    ds4_metrics_get_snapshot(&metrics_baseline);
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
@@ -11621,6 +11655,7 @@ decode_again:
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    double first_token_t = 0.0;
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -11665,6 +11700,7 @@ decode_again:
             finish = "stop";
             break;
         }
+        if (first_token_t == 0.0) first_token_t = now_sec();
 
         int toks[17];
         int ntok = 0;
@@ -12157,7 +12193,10 @@ decode_again:
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                 parsed_reasoning, &parsed_calls, now_sec() - t0);
+                 parsed_reasoning, &parsed_calls, now_sec() - t0,
+                 decode_t0 > t0 ? decode_t0 - t0 : 0.0,
+                 first_token_t > t0 ? first_token_t - t0 : 0.0,
+                 &metrics_baseline);
 
     if (j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
@@ -12728,6 +12767,156 @@ static bool client_socket_disconnected(int fd) {
     }
 }
 
+/* ---- monitoring endpoints (web UI phase 1, see docs/WEB_UI_DESIGN.md) ---- */
+
+static int server_active_requests(server *s) {
+    int active = 0;
+    pthread_mutex_lock(&s->model_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        if (s->slots[i].busy) active++;
+    }
+    pthread_mutex_unlock(&s->model_mu);
+    return active;
+}
+
+static void append_prompt_stat_json(buf *b, const ds4_prompt_stat *p) {
+    buf_printf(b,
+        "{\"id\":%llu,\"ts\":%.3f,\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+        "\"prefill_s\":%.4f,\"ttft_s\":%.4f,\"gen_s\":%.4f,\"tok_s\":%.2f,"
+        "\"cache_read_tokens\":%d,\"cache_write_tokens\":%d,"
+        "\"expert_hits\":%llu,\"expert_misses\":%llu,"
+        "\"disk_bytes\":%llu,\"disk_s\":%.4f}",
+        (unsigned long long)p->id,
+        p->ts,
+        p->prompt_tokens,
+        p->completion_tokens,
+        p->prefill_s,
+        p->ttft_s,
+        p->gen_s,
+        p->tok_s,
+        p->cache_read_tokens,
+        p->cache_write_tokens,
+        (unsigned long long)p->expert_hits,
+        (unsigned long long)p->expert_misses,
+        (unsigned long long)p->disk_bytes,
+        p->disk_s);
+}
+
+static void send_health(server *s, int fd) {
+    ds4_metrics_snapshot m;
+    ds4_metrics_get_snapshot(&m);
+    const uint64_t lookups = m.expert_hits + m.expert_misses;
+    const double hit_rate = lookups ? (double)m.expert_hits / (double)lookups : 0.0;
+    const double avg_read_ms = m.disk_reads ?
+        m.disk_read_s / (double)m.disk_reads * 1000.0 : 0.0;
+    const double throughput_mbs = m.disk_read_s > 0.0 ?
+        (double)m.disk_bytes / m.disk_read_s / (1024.0 * 1024.0) : 0.0;
+    /* In CPU mode expert data comes from mmap page faults, which the
+     * backend hooks never see; fall back to the /proc/self/io rate. */
+    const double eff_mbs = m.disk_read_s > 0.0 ? throughput_mbs : m.proc_read_mbs;
+    buf b = {0};
+    buf_printf(&b,
+        "{\"status\":\"ok\",\"model\":\"%s\",\"uptime_s\":%.1f,"
+        "\"expert_cache\":{\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f},"
+        "\"disk\":{\"bytes_read\":%llu,\"reads\":%llu,\"total_read_s\":%.4f,"
+        "\"avg_read_ms\":%.3f,\"throughput_mbs\":%.2f,"
+        "\"proc_read_bytes\":%llu,\"proc_read_mbs\":%.2f}}\n",
+        server_model_id_from_engine(s->engine),
+        m.uptime_s,
+        (unsigned long long)m.expert_hits,
+        (unsigned long long)m.expert_misses,
+        hit_rate,
+        (unsigned long long)m.disk_bytes,
+        (unsigned long long)m.disk_reads,
+        m.disk_read_s,
+        avg_read_ms,
+        eff_mbs,
+        (unsigned long long)m.proc_read_bytes,
+        m.proc_read_mbs);
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
+static void send_profile(server *s, int fd) {
+    ds4_prompt_stat prompts[DS4_METRICS_PROMPT_CAPACITY];
+    const int n = ds4_metrics_get_prompts(prompts, DS4_METRICS_PROMPT_CAPACITY);
+    ds4_metrics_snapshot m;
+    ds4_metrics_get_snapshot(&m);
+    buf b = {0};
+    buf_printf(&b, "{\"seq\":%llu,\"prompts\":[", (unsigned long long)m.prompt_count);
+    for (int i = 0; i < n; i++) {
+        if (i) buf_putc(&b, ',');
+        append_prompt_stat_json(&b, &prompts[i]);
+    }
+    buf_puts(&b, "]}\n");
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
+/* One JSON snapshot per second over SSE, using the same send path as the
+ * inference streaming code (sse_headers + send_all) so the non-blocking
+ * socket conventions and CORS behavior match.  The loop ends when the client
+ * disconnects (send_all fails or a FIN is polled) or the server stops. */
+static void metrics_stream_main(server *s, int fd) {
+    if (!sse_headers(fd, s->enable_cors)) return;
+    while (!g_stop_requested) {
+        ds4_metrics_snapshot m;
+        ds4_metrics_get_snapshot(&m);
+        const uint64_t lookups = m.expert_hits + m.expert_misses;
+        const double hit_rate = lookups ? (double)m.expert_hits / (double)lookups : 0.0;
+        const double hook_mbs = m.disk_read_s > 0.0 ?
+            (double)m.disk_bytes / m.disk_read_s / (1024.0 * 1024.0) : 0.0;
+        /* CPU mode reads experts through mmap page faults, invisible to the
+         * backend hooks; use the /proc/self/io rate in that case. */
+        const double disk_mbs = m.disk_read_s > 0.0 ? hook_mbs : m.proc_read_mbs;
+        const uint64_t disk_bytes = m.disk_bytes ? m.disk_bytes : m.proc_read_bytes;
+        const double disk_avg_ms = m.disk_reads ?
+            m.disk_read_s / (double)m.disk_reads * 1000.0 : 0.0;
+        buf b = {0};
+        buf_printf(&b,
+            "data: {\"ts\":%.3f,\"active_requests\":%d,\"cache_hit_rate\":%.4f,"
+            "\"disk_mbs\":%.2f,\"disk_avg_ms\":%.3f,"
+            "\"expert_hits\":%llu,\"expert_misses\":%llu,\"disk_bytes\":%llu}\n\n",
+            m.uptime_s,
+            server_active_requests(s),
+            hit_rate,
+            disk_mbs,
+            disk_avg_ms,
+            (unsigned long long)m.expert_hits,
+            (unsigned long long)m.expert_misses,
+            (unsigned long long)disk_bytes);
+        const bool ok = send_all(fd, b.ptr, b.len);
+        buf_free(&b);
+        if (!ok) break;
+
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+        while (!g_stop_requested && nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        if (g_stop_requested || client_socket_disconnected(fd)) break;
+    }
+}
+
+/* Traversal-safe: serves only the literal web/index.html relative to the
+ * current working directory, read fresh on every request. */
+static void send_index_html(server *s, int fd) {
+    FILE *fp = fopen("web/index.html", "rb");
+    if (!fp) {
+        http_error(fd, s->enable_cors, 404, "not found");
+        return;
+    }
+    const size_t cap = 4u * 1024u * 1024u;
+    char *body = malloc(cap + 1);
+    if (!body) {
+        fclose(fp);
+        http_error(fd, s->enable_cors, 500, "out of memory");
+        return;
+    }
+    const size_t n = fread(body, 1, cap, fp);
+    fclose(fp);
+    body[n] = '\0';  /* http_response uses strlen; embedded NULs truncate */
+    http_response(fd, s->enable_cors, 200, "text/html", body);
+    free(body);
+}
+
 /* Mark first, then detach only work that no worker owns yet. No job mutex is
  * held while entering either server scheduler mutex. */
 static void server_cancel_job(server *s, job *j) {
@@ -12810,6 +12999,27 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
+        send_health(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/profile")) {
+        send_profile(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics/stream")) {
+        metrics_stream_main(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/") || !strcmp(hr.path, "/index.html"))) {
+        send_index_html(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -13312,6 +13522,8 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    ds4_metrics_init();
 
     server_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {

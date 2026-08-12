@@ -24,6 +24,7 @@
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
+#include "ds4_metrics.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -2339,6 +2340,8 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
 
 static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
+    struct timespec pread_t0, pread_t1;
+    clock_gettime(CLOCK_MONOTONIC, &pread_t0);
     while (done < bytes) {
         const size_t n_req = (bytes - done > (uint64_t)SSIZE_MAX) ? (size_t)SSIZE_MAX : (size_t)(bytes - done);
         ssize_t n = pread(fd, (char *)buf + done, n_req, (off_t)(offset + done));
@@ -2349,6 +2352,10 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
         if (n == 0) return 0;
         done += (uint64_t)n;
     }
+    clock_gettime(CLOCK_MONOTONIC, &pread_t1);
+    ds4_metrics_disk_read(bytes,
+        (double)(pread_t1.tv_sec - pread_t0.tv_sec) +
+        (double)(pread_t1.tv_nsec - pread_t0.tv_nsec) * 1e-9);
     return 1;
 }
 
@@ -27531,6 +27538,7 @@ static int cuda_stream_selected_cache_begin_load(
                 }
             }
             g_stream_layer_cache.hits++;
+            ds4_metrics_expert_hit();
             if (g_prefix_active &&
                 g_stream_prompt_lifecycle_phase == DS4_PROMPT_CACHE_PHASE_PREFILL &&
                 cuda_prefix_profile_frequency(table->layer,
@@ -27582,6 +27590,9 @@ static int cuda_stream_selected_cache_begin_load(
     persistent_miss_count = (uint32_t)persistent_miss_indices.size();
     if (persistent_active) {
         g_stream_layer_cache.misses += persistent_miss_count;
+        for (uint32_t m = 0; m < persistent_miss_count; m++) {
+            ds4_metrics_expert_miss();
+        }
         g_stream_layer_cache.model_bytes_read +=
             (uint64_t)persistent_miss_count * expert_payload_bytes;
     }
