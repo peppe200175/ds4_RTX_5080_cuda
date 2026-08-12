@@ -40,17 +40,21 @@
 #include <time.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t g_stop_requested = 0;
-static volatile sig_atomic_t g_listen_fd = -1;
-
-#define DS4_SERVER_IO_TIMEOUT_SEC 10
-#define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
-
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
 #else
 #define DS4_SERVER_MAYBE_UNUSED
 #endif
+
+static volatile sig_atomic_t g_stop_requested = 0;
+static volatile sig_atomic_t g_restart_requested = 0;
+static volatile sig_atomic_t g_listen_fd = -1;
+static int g_restart_argc DS4_SERVER_MAYBE_UNUSED;
+static char **g_restart_argv DS4_SERVER_MAYBE_UNUSED;
+static char g_restart_exe[PATH_MAX] DS4_SERVER_MAYBE_UNUSED;
+
+#define DS4_SERVER_IO_TIMEOUT_SEC 10
+#define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
 static void stop_signal_handler(int sig) {
     (void)sig;
@@ -8487,6 +8491,7 @@ struct server {
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    bool allow_web_restart;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -12595,6 +12600,7 @@ static void *slot_worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    char origin[256];
     char *body;
     size_t body_len;
 } http_request;
@@ -12631,6 +12637,31 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static void copy_header_value(const char *h, size_t n, const char *name,
+                              char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && !strncasecmp(line, name, name_len) &&
+            line[name_len] == ':') {
+            const char *v = line + name_len + 1;
+            while (v < line + len && isspace((unsigned char)*v)) v++;
+            size_t value_len = (size_t)((line + len) - v);
+            if (value_len >= out_size) value_len = out_size - 1;
+            memcpy(out, v, value_len);
+            out[value_len] = '\0';
+            return;
+        }
+        if (p < end) p++;
+    }
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -12657,6 +12688,8 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+    copy_header_value(b.ptr, (size_t)hend, "Origin",
+                      r->origin, sizeof(r->origin));
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -12683,6 +12716,13 @@ typedef struct {
     server *srv;
     int fd;
 } client_arg;
+
+static bool restart_origin_allowed(const char *origin) {
+    if (!origin || !origin[0]) return true; /* non-browser local clients */
+    return !strncmp(origin, "http://127.0.0.1:", 17) ||
+           !strncmp(origin, "http://localhost:", 17) ||
+           !strncmp(origin, "http://[::1]:", 13);
+}
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens) {
@@ -12926,51 +12966,38 @@ static void metrics_stream_main(server *s, int fd) {
     }
 }
 
-/* Expert routing heat map for the monitor's Brain-style view.  JSON shape
- * matches web/index.html: heat is a sparse list of [layer, expert, heat]
- * triples (heat 0..255, only non-zero cells), top carries the hottest cells
- * as [layer, expert, count].  No "resident" array: ds4 keeps routing
- * frequency, not per-cell VRAM residency, so the UI treats heat-only cells
- * as cold/gray. */
+/* Expert routing and cache snapshot. Cache decisions are deliberately
+ * grouped by expert id across layers: residency is an expert-cache property
+ * and the monitor must not imply that routing heat is a cache hit. */
 static void send_experts(server *s, int fd) {
-    uint8_t *heat = xmalloc((size_t)DS4_EXPERT_MAP_MAX_LAYER *
-                            DS4_EXPERT_MAP_MAX_EXPERT);
-    memset(heat, 0, (size_t)DS4_EXPERT_MAP_MAX_LAYER *
-                    DS4_EXPERT_MAP_MAX_EXPERT);
-    enum { TOP = 64 };
-    uint32_t top_l[TOP], top_e[TOP], top_c[TOP];
-    uint32_t n_expert = 0;
-    const int layers = ds4_expert_map_snapshot(heat, DS4_EXPERT_MAP_MAX_LAYER,
-                                               &n_expert,
-                                               top_l, top_e, top_c, TOP);
-    if (layers <= 0 || n_expert == 0) {
-        free(heat);
-        http_error(fd, s->enable_cors, 404, "no expert routing data yet");
+    const int layers = ds4_engine_layer_count(s->engine);
+    const int expert_count = ds4_engine_expert_count(s->engine);
+    if (layers <= 0 || expert_count <= 0) {
+        http_error(fd, s->enable_cors, 404, "model has no routed experts");
         return;
     }
+    const uint32_t n_expert = (uint32_t)expert_count;
 
     buf b = {0};
-    buf_printf(&b, "{\"layers\":%d,\"experts_per_layer\":%u,\"heat\":[",
+    buf_printf(&b, "{\"layers\":%d,\"experts_per_layer\":%u,\"heat\":[],\"top\":[],\"cache\":[",
                layers, n_expert);
     bool first = true;
-    for (int il = 0; il < layers; il++) {
-        for (uint32_t e = 0; e < n_expert; e++) {
-            const unsigned h = heat[(size_t)il * n_expert + e];
-            if (!h) continue;
-            if (!first) buf_putc(&b, ',');
-            first = false;
-            buf_printf(&b, "[%d,%u,%u]", il, e, h);
-        }
-    }
-    buf_puts(&b, "],\"top\":[");
-    for (int i = 0; i < TOP && top_c[i]; i++) {
-        if (i) buf_putc(&b, ',');
-        buf_printf(&b, "[%u,%u,%u]", top_l[i], top_e[i], top_c[i]);
+    uint64_t cache_hits[DS4_METRICS_EXPERT_CAPACITY];
+    uint64_t cache_misses[DS4_METRICS_EXPERT_CAPACITY];
+    const uint32_t cache_n = ds4_metrics_get_experts(
+        cache_hits, cache_misses, DS4_METRICS_EXPERT_CAPACITY);
+    first = true;
+    for (uint32_t e = 0; e < n_expert && e < cache_n; e++) {
+        if (cache_hits[e] == 0 && cache_misses[e] == 0) continue;
+        if (!first) buf_putc(&b, ',');
+        first = false;
+        buf_printf(&b, "[%u,%llu,%llu]", e,
+                   (unsigned long long)cache_hits[e],
+                   (unsigned long long)cache_misses[e]);
     }
     buf_puts(&b, "]}\n");
     http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
-    free(heat);
 }
 
 /* Traversal-safe: serves only the literal web/index.html relative to the
@@ -13097,6 +13124,36 @@ static void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/experts")) {
         send_experts(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/admin/restart")) {
+        if (!s->allow_web_restart) {
+            http_error(fd, s->enable_cors, 403,
+                       "web restart is available only on a loopback listener");
+        } else if (!restart_origin_allowed(hr.origin) ||
+                   strcmp(hr.body ? hr.body : "", "restart")) {
+            http_error(fd, s->enable_cors, 403, "restart confirmation rejected");
+        } else {
+            http_response(fd, s->enable_cors, 202, "application/json",
+                          "{\"status\":\"restarting\",\"arguments\":\"preserved\"}\n");
+            g_restart_requested = 1;
+            g_stop_requested = 1;
+            if (g_listen_fd >= 0) {
+                const int restart_lfd = (int)g_listen_fd;
+                g_listen_fd = -1;
+                shutdown(restart_lfd, SHUT_RDWR);
+                close(restart_lfd);
+            }
+        }
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/admin/restart")) {
+        http_response(fd, s->enable_cors, 200, "application/json",
+                      s->allow_web_restart ?
+                      "{\"available\":true}\n" :
+                      "{\"available\":false}\n");
         http_request_free(&hr);
         goto done;
     }
@@ -13598,6 +13655,14 @@ static void server_request_decode_stop(server *s) {
 }
 
 int main(int argc, char **argv) {
+    g_restart_argc = argc;
+    g_restart_argv = argv;
+    const ssize_t restart_exe_len =
+        readlink("/proc/self/exe", g_restart_exe, sizeof(g_restart_exe) - 1);
+    if (restart_exe_len > 0)
+        g_restart_exe[restart_exe_len] = '\0';
+    else
+        snprintf(g_restart_exe, sizeof(g_restart_exe), "%s", argv[0]);
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -13651,11 +13716,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* The expert routing profiler powers the monitor's /experts heat map.
-     * Enable it unconditionally (no output file); the per-token overhead is a
-     * few histogram increments. */
-    ds4_expert_map_enable();
-
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {
             .ctx_size = cfg.ctx_size,
@@ -13683,6 +13743,9 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.allow_web_restart = !strcmp(cfg.host, "127.0.0.1") ||
+                          !strcmp(cfg.host, "localhost") ||
+                          !strcmp(cfg.host, "::1");
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -13715,6 +13778,42 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+    }
+
+    /* Match the CLI's startup behavior: pay one-time GPU pipeline creation
+     * and lazy model-tensor residency before accepting traffic. Otherwise the
+     * first request reports several seconds of model loading as "prefill".
+     * Warm every session because kernels/scratch can be session-local; the
+     * engine-shared weight cache makes sessions after the first inexpensive. */
+    if (cfg.engine.backend != DS4_BACKEND_CPU) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: warming %d GPU session%s before listen",
+                   slot_count, slot_count == 1 ? "" : "s");
+        for (int i = 0; i < slot_count; i++)
+            ds4_session_gpu_warmup(s.slots[i].session);
+        /* The lightweight hook above prepares kernels, but SSD streaming also
+         * maps most non-expert tensors lazily on the first real prefill. Run a
+         * disposable batch so that I/O is startup time, not user TTFT. */
+        ds4_tokens warm_tokens = {0};
+        ds4_tokenize_text(engine,
+            "Warm the inference engine and prepare every model layer for the first request. "
+            "This internal prompt is discarded before the server accepts traffic.",
+            &warm_tokens);
+        char warm_err[160] = {0};
+        if (warm_tokens.len > 0 &&
+            ds4_session_sync(s.slots[0].session, &warm_tokens,
+                             warm_err, sizeof(warm_err)) == 0) {
+            ds4_session_invalidate(s.slots[0].session);
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: GPU model residency warmup complete (%d tokens)",
+                       warm_tokens.len);
+        } else {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: GPU model residency warmup skipped: %s",
+                       warm_err[0] ? warm_err : "tokenization failed");
+        }
+        ds4_tokens_free(&warm_tokens);
+        ds4_metrics_reset_activity();
     }
 
     if (cfg.kv_disk_dir) {
@@ -13863,6 +13962,15 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
+    if (g_restart_requested) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: relaunching with %d preserved arguments",
+                   g_restart_argc);
+        execv(g_restart_exe, g_restart_argv);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: restart exec failed: %s",
+                   strerror(errno));
+        return 1;
+    }
     return 0;
 }
 #else

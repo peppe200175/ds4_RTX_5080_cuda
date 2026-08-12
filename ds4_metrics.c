@@ -15,6 +15,8 @@ static pthread_mutex_t g_metrics_mu;
 static double g_metrics_start;  /* CLOCK_MONOTONIC seconds at init */
 static uint64_t g_expert_hits;
 static uint64_t g_expert_misses;
+static uint64_t g_expert_hits_by_id[DS4_METRICS_EXPERT_CAPACITY];
+static uint64_t g_expert_misses_by_id[DS4_METRICS_EXPERT_CAPACITY];
 static uint64_t g_disk_bytes;
 static uint64_t g_disk_reads;
 static double g_disk_read_s;
@@ -80,18 +82,35 @@ void ds4_metrics_record_prompt(const ds4_prompt_stat *stat) {
     pthread_mutex_unlock(&g_metrics_mu);
 }
 
-void ds4_metrics_expert_hit(void) {
+void ds4_metrics_expert_hit(uint32_t expert) {
     ds4_metrics_init();
     pthread_mutex_lock(&g_metrics_mu);
     g_expert_hits++;
+    if (expert < DS4_METRICS_EXPERT_CAPACITY)
+        g_expert_hits_by_id[expert]++;
     pthread_mutex_unlock(&g_metrics_mu);
 }
 
-void ds4_metrics_expert_miss(void) {
+void ds4_metrics_expert_miss(uint32_t expert) {
     ds4_metrics_init();
     pthread_mutex_lock(&g_metrics_mu);
     g_expert_misses++;
+    if (expert < DS4_METRICS_EXPERT_CAPACITY)
+        g_expert_misses_by_id[expert]++;
     pthread_mutex_unlock(&g_metrics_mu);
+}
+
+uint32_t ds4_metrics_get_experts(uint64_t *hits, uint64_t *misses,
+                                 uint32_t capacity) {
+    if (!hits || !misses || capacity == 0) return 0;
+    ds4_metrics_init();
+    const uint32_t n = capacity < DS4_METRICS_EXPERT_CAPACITY ?
+        capacity : DS4_METRICS_EXPERT_CAPACITY;
+    pthread_mutex_lock(&g_metrics_mu);
+    memcpy(hits, g_expert_hits_by_id, (size_t)n * sizeof(*hits));
+    memcpy(misses, g_expert_misses_by_id, (size_t)n * sizeof(*misses));
+    pthread_mutex_unlock(&g_metrics_mu);
+    return n;
 }
 
 void ds4_metrics_disk_read(uint64_t bytes, double seconds) {
@@ -100,6 +119,24 @@ void ds4_metrics_disk_read(uint64_t bytes, double seconds) {
     g_disk_bytes += bytes;
     g_disk_reads++;
     g_disk_read_s += seconds;
+    pthread_mutex_unlock(&g_metrics_mu);
+}
+
+void ds4_metrics_reset_activity(void) {
+    ds4_metrics_init();
+    pthread_mutex_lock(&g_metrics_mu);
+    g_expert_hits = 0;
+    g_expert_misses = 0;
+    memset(g_expert_hits_by_id, 0, sizeof(g_expert_hits_by_id));
+    memset(g_expert_misses_by_id, 0, sizeof(g_expert_misses_by_id));
+    g_disk_bytes = 0;
+    g_disk_reads = 0;
+    g_disk_read_s = 0.0;
+    const uint64_t rb = ds4_metrics_proc_io_read_bytes();
+    g_proc_read_bytes = rb;
+    g_proc_prev_bytes = rb;
+    g_proc_prev_t = ds4_metrics_now();
+    g_proc_read_mbs = 0.0;
     pthread_mutex_unlock(&g_metrics_mu);
 }
 

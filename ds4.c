@@ -59318,6 +59318,11 @@ int ds4_engine_layer_count(ds4_engine *e) {
     return (int)DS4_N_LAYER;
 }
 
+int ds4_engine_expert_count(ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_EXPERT;
+}
+
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
     (void)e;
     if (layer >= DS4_N_LAYER) return 0;

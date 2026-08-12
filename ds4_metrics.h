@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 #define DS4_METRICS_PROMPT_CAPACITY 64
+#define DS4_METRICS_EXPERT_CAPACITY 384
 
 typedef struct ds4_prompt_stat {
     uint64_t id;
@@ -47,9 +48,16 @@ void ds4_metrics_init(void);
  * monotonically increasing id is assigned. */
 void ds4_metrics_record_prompt(const ds4_prompt_stat *stat);
 
-void ds4_metrics_expert_hit(void);
-void ds4_metrics_expert_miss(void);
+void ds4_metrics_expert_hit(uint32_t expert);
+void ds4_metrics_expert_miss(uint32_t expert);
 void ds4_metrics_disk_read(uint64_t bytes, double seconds);
+/* Clears activity counters after internal startup work such as GPU warmup. */
+void ds4_metrics_reset_activity(void);
+
+/* Copies cumulative cache decisions grouped by expert id (across layers).
+ * Returns the number of expert slots copied. */
+uint32_t ds4_metrics_get_experts(uint64_t *hits, uint64_t *misses,
+                                 uint32_t capacity);
 
 /* Copies the counters out under the lock.  uptime_s is seconds since the
  * first ds4_metrics_init(). */

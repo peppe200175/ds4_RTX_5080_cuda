@@ -226,6 +226,7 @@ int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
+int ds4_engine_expert_count(ds4_engine *e);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,

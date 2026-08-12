@@ -64,8 +64,8 @@ Served from a C string (`ds4_web_ui.h`, generated or hand-written). Two tabs:
 - **Monitor**:
   - Per-prompt table from `/profile` (tok/s, TTFT, prefill/decode split, cache tokens).
   - Live charts from `/metrics/stream`: tok/s, prefill t/s, disk MB/s, avg disk read latency.
-  - Expert panel: grid layers × experts (canvas), color = tier (VRAM green / disk gray),
-    brightness = call heat, flash on call — same idea as Colibri's Brain page.
+  - Expert panel: one cell per expert ID (canvas), green/orange balance =
+    cache hits/misses and brightness = access volume; hover shows exact totals.
   - Tier bar: resident vs total experts, VRAM bytes used.
   - Disk panel: cumulative bytes, reads, hit rate gauge.
 
@@ -79,7 +79,8 @@ Served from a C string (`ds4_web_ui.h`, generated or hand-written). Two tabs:
 ## Implementation notes (as built)
 
 - `ds4_metrics.c/.h` — pthread-mutex collector; prompt ring (64), expert
-  hit/miss counters, hook-based disk bytes, and a `/proc/self/io` sampler
+  global and per-expert hit/miss counters, hook-based disk bytes, and a
+  `/proc/self/io` sampler
   (`proc_read_bytes`, `proc_read_mbs`) so CPU/mmap streaming also reports disk
   throughput. `ds4_metrics_latest_prompt()` feeds the SSE trailer.
 - Endpoints in `ds4_server.c` `client_main()` routing:
@@ -96,20 +97,27 @@ Served from a C string (`ds4_web_ui.h`, generated or hand-written). Two tabs:
   - Expert hit/miss + pread timing hooks in `ds4_cuda.cu`
     (`cuda_stream_selected_cache_begin_load`, `cuda_pread_full`) and the Metal
     stream range reader in `ds4.c`.
-  - CPU expert routing recorded in `layer_routed_moe_one_prealloc()` via
-    `ds4_expert_profile_record()`; the profiler is enabled file-less at server
-    startup via `ds4_expert_map_enable()`, and exposed read-only through
-    `ds4_expert_map_snapshot()` (declared in `ds4.h`).
+  - `/experts` uses direct per-expert cache counters and model dimensions. The
+    old layer routing profiler stays disabled because its GPU tensor readbacks
+    introduce command-buffer synchronization not present in terminal runs.
 - Chat SSE: `sse_done()` now emits `data: {"ds4": {...per-request stats...}}`
   immediately before `data: [DONE]` for OpenAI-protocol streams (no-op for
   Anthropic/Responses envelopes and when no prompt was recorded, so the
   existing test-mode assertions are unaffected).
+- The header restart control posts to `/admin/restart`. It is enabled only for
+  loopback listeners, rejects non-local browser origins, drains the server,
+  and re-execs the same binary with its original command-line arguments and
+  environment.
 
 ### Known scope limits
-- `resident` per-cell VRAM residency is not tracked by the engine, so
-  `/experts` omits it; the UI renders heat-only cells as cold/gray.
+- Cache decisions are aggregated by expert ID across layers. The routing heat
+  data remains layer-aware, but the cache panel intentionally does not imply
+  per-layer residency that the engine does not track.
+- The built-in web chat defaults to `reasoning_effort: none`, matching the
+  machine's `run_ds4_cuda.sh --nothink` baseline. Its remembered Thinking
+  toggle requests `high`; streamed `reasoning_content` is rendered live in a
+  separate amber, collapsible panel above the final answer.
 - On `--cpu`, expert hit/miss counters stay 0 (no explicit cache layer — mmap
   plus OS page cache); disk metrics come from the `/proc/self/io` fallback.
 - `expert_hits`/`expert_misses` reflect the CUDA streaming cache; on CPU they
   are 0 by design.
-

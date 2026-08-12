@@ -27538,7 +27538,7 @@ static int cuda_stream_selected_cache_begin_load(
                 }
             }
             g_stream_layer_cache.hits++;
-            ds4_metrics_expert_hit();
+            ds4_metrics_expert_hit((uint32_t)expert);
             if (g_prefix_active &&
                 g_stream_prompt_lifecycle_phase == DS4_PROMPT_CACHE_PHASE_PREFILL &&
                 cuda_prefix_profile_frequency(table->layer,
@@ -27591,7 +27591,8 @@ static int cuda_stream_selected_cache_begin_load(
     if (persistent_active) {
         g_stream_layer_cache.misses += persistent_miss_count;
         for (uint32_t m = 0; m < persistent_miss_count; m++) {
-            ds4_metrics_expert_miss();
+            ds4_metrics_expert_miss(
+                (uint32_t)compact_ids[persistent_miss_indices[m]]);
         }
         g_stream_layer_cache.model_bytes_read +=
             (uint64_t)persistent_miss_count * expert_payload_bytes;

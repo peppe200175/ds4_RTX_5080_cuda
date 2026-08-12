@@ -69,6 +69,7 @@ header .logo span { color: var(--blue); }
 #streamState { margin-left: auto; color: var(--dim); font-size: 12px; }
 #streamState.live { color: var(--green); }
 #streamState.down { color: var(--orange); }
+#restartBtn { padding: 5px 10px; font-size: 11px; }
 /* ---------- views ---------- */
 main { flex: 1 1 auto; min-height: 0; display: flex; }
 .view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; width: 100%; }
@@ -140,6 +141,19 @@ main { flex: 1 1 auto; min-height: 0; display: flex; }
 .typing i:nth-child(2) { animation-delay: .2s; }
 .typing i:nth-child(3) { animation-delay: .4s; }
 @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+.thinkingPanel {
+  margin: 0 0 8px; border: 1px solid rgba(210,153,34,.45);
+  border-radius: 6px; background: rgba(210,153,34,.07); overflow: hidden;
+}
+.thinkingPanel[open] { box-shadow: inset 3px 0 0 var(--orange); }
+.thinkingPanel summary {
+  cursor: pointer; padding: 6px 9px; color: var(--orange);
+  font-size: 11px; font-weight: 600; user-select: none;
+}
+.thinkingBody {
+  max-height: 260px; overflow: auto; padding: 0 10px 9px;
+  color: var(--dim); font-size: 12px;
+}
 /* live badge above composer */
 #liveBadge {
   flex: 0 0 auto;
@@ -177,6 +191,14 @@ main { flex: 1 1 auto; min-height: 0; display: flex; }
   outline: none;
 }
 #composer:focus { border-color: var(--blue); }
+.thinkControl {
+  display: flex; align-items: center; gap: 6px; height: 38px;
+  padding: 0 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel2); color: var(--dim); font-size: 11px;
+  cursor: pointer; white-space: nowrap;
+}
+.thinkControl:has(input:checked) { color: var(--orange); border-color: rgba(210,153,34,.65); }
+.thinkControl input { accent-color: var(--orange); }
 .btn {
   background: var(--panel2);
   color: var(--fg);
@@ -267,6 +289,12 @@ tr.row-new td { animation: rowFlash 2s ease-out; }
 #splitLegend { font-size: 10px; color: var(--dim); margin-bottom: 10px; display: flex; justify-content: space-between; }
 #expertGridWrap { flex: 1 1 auto; min-height: 120px; position: relative; }
 #expertGrid { width: 100%; height: 100%; display: block; }
+#expertTip {
+  position: fixed; z-index: 20; display: none; pointer-events: none;
+  padding: 7px 9px; border: 1px solid var(--border); border-radius: 5px;
+  background: #0d1117; color: var(--fg); font-size: 11px;
+  line-height: 1.45; box-shadow: 0 4px 14px rgba(0,0,0,.4);
+}
 #expertGridNote {
   position: absolute; inset: 0;
   display: none;
@@ -291,6 +319,7 @@ tr.row-new td { animation: rowFlash 2s ease-out; }
     <button id="tabMonitor" data-view="monitor">Monitor</button>
   </nav>
   <span id="streamState">metrics: connecting…</span>
+  <button id="restartBtn" class="btn danger" title="Restart with the current model and cache parameters">Restart server</button>
 </header>
 <main>
   <!-- ================= CHAT ================= -->
@@ -304,6 +333,7 @@ tr.row-new td { animation: rowFlash 2s ease-out; }
     </div>
     <div id="composerBar">
       <textarea id="composer" rows="1" placeholder="Message ds4… (Enter to send, Shift+Enter for newline)"></textarea>
+      <label class="thinkControl" title="Show model reasoning separately from the final answer"><input id="thinkingToggle" type="checkbox"> Thinking</label>
       <button id="clearBtn" class="btn">Clear</button>
       <button id="sendBtn" class="btn primary">Send</button>
     </div>
@@ -340,17 +370,18 @@ tr.row-new td { animation: rowFlash 2s ease-out; }
         </div>
       </div>
       <div class="card" id="expertCard">
-        <h2>Expert activity</h2>
+        <h2>Expert cache by expert ID</h2>
         <div id="expertCounters">
           <div class="bigCounter" id="cntHits"><div class="n">0</div><div class="l">VRAM hits</div></div>
           <div class="bigCounter" id="cntMiss"><div class="n">0</div><div class="l">disk fetches</div></div>
         </div>
         <div id="splitBar"><div id="splitHits"></div><div id="splitMiss"></div></div>
-        <div id="splitLegend"><span>■ VRAM (hits)</span><span id="splitPct">—</span><span>■ disk (misses)</span></div>
+        <div id="splitLegend"><span style="color:var(--green)">■ cache hit</span><span id="splitPct">—</span><span style="color:var(--orange)">■ cache miss</span></div>
         <div id="expertGridWrap">
           <canvas id="expertGrid"></canvas>
-          <div id="expertGridNote">expert map unavailable (waiting for /experts)</div>
+          <div id="expertGridNote">waiting for per-expert cache activity</div>
         </div>
+        <div id="expertTip"></div>
       </div>
     </div>
   </section>
@@ -391,6 +422,54 @@ function el(tag, cls, text) {
   if (text !== undefined) e.textContent = text;
   return e;
 }
+
+/* ================= controlled server restart ================= */
+const restartBtn = $('restartBtn');
+async function detectRestartSupport() {
+  try {
+    const r = await fetch('/admin/restart', { cache: 'no-store' });
+    if (!r.ok) throw new Error();
+    const status = await r.json();
+    if (!status.available) throw new Error();
+  } catch (_) {
+    restartBtn.disabled = true;
+    restartBtn.textContent = 'Restart unavailable';
+    restartBtn.title = 'Stop and launch the newly compiled server once to enable web restart';
+  }
+}
+detectRestartSupport();
+restartBtn.addEventListener('click', async () => {
+  if (!confirm('Restart ds4-server now? Active generations will stop. Current launch parameters will be preserved.')) return;
+  restartBtn.disabled = true;
+  restartBtn.textContent = 'Restarting…';
+  $('streamState').textContent = 'server: restarting';
+  try {
+    const r = await fetch('/admin/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'restart'
+    });
+    if (!r.ok) {
+      if (r.status === 404) throw new Error('the running server is an older binary; stop it and launch ./run_ds4_cuda_server.sh once');
+      throw new Error((await r.text()) || ('HTTP ' + r.status));
+    }
+    const deadline = Date.now() + 180000;
+    let sawOffline = false;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        const health = await fetch('/health', { cache: 'no-store' });
+        if (health.ok && sawOffline) { location.reload(); return; }
+      } catch (_) { sawOffline = true; }
+    }
+    throw new Error('restart timed out');
+  } catch (err) {
+    restartBtn.disabled = false;
+    restartBtn.textContent = 'Restart server';
+    $('streamState').textContent = 'restart failed';
+    alert('Server restart failed: ' + err.message);
+  }
+});
 
 /* ================= tabs ================= */
 const tabBtns = { chat: $('tabChat'), monitor: $('tabMonitor') };
@@ -484,12 +563,17 @@ function mdRender(container, text) {
 /* ================= chat ================= */
 const msgList = $('msgList');
 const composer = $('composer');
+const thinkingToggle = $('thinkingToggle');
 const sendBtn = $('sendBtn');
 const clearBtn = $('clearBtn');
 const liveBadge = $('liveBadge');
 const lbTokens = $('lbTokens'), lbElapsed = $('lbElapsed'), lbTokS = $('lbTokS'), lbFinal = $('lbFinal');
 
 const chat = { msgs: [], ctrl: null, sending: false };
+thinkingToggle.checked = localStorage.getItem('ds4-thinking') === '1';
+thinkingToggle.addEventListener('change', () => {
+  localStorage.setItem('ds4-thinking', thinkingToggle.checked ? '1' : '0');
+});
 
 function scrollBottom() {
   const nearBottom = msgList.scrollHeight - msgList.scrollTop - msgList.clientHeight < 160;
@@ -510,6 +594,13 @@ function addAssistantShell() {
   const wrap = el('div', 'msg assistant');
   wrap.appendChild(el('div', 'role', 'ds4'));
   const bubble = el('div', 'bubble');
+  const thinkingPanel = el('details', 'thinkingPanel');
+  const thinkingSummary = el('summary', null, 'Thinking…');
+  const thinkingBody = el('div', 'thinkingBody');
+  thinkingPanel.appendChild(thinkingSummary);
+  thinkingPanel.appendChild(thinkingBody);
+  thinkingPanel.style.display = 'none';
+  bubble.appendChild(thinkingPanel);
   const typing = el('span', 'typing');
   typing.appendChild(el('i')); typing.appendChild(el('i')); typing.appendChild(el('i'));
   bubble.appendChild(typing);
@@ -519,7 +610,7 @@ function addAssistantShell() {
   wrap.appendChild(statsRow);
   msgList.appendChild(wrap);
   msgList.scrollTop = msgList.scrollHeight;
-  return { bubble, typing, statsRow };
+  return { bubble, typing, statsRow, thinkingPanel, thinkingSummary, thinkingBody };
 }
 
 function badge(label, value) {
@@ -549,6 +640,7 @@ function setSending(on) {
   sendBtn.classList.toggle('danger', on);
   sendBtn.classList.toggle('primary', !on);
   composer.disabled = false;
+  thinkingToggle.disabled = on;
 }
 
 function liveReset() {
@@ -576,11 +668,29 @@ async function sendChat() {
   liveReset();
   chat.ctrl = new AbortController();
   const shell = addAssistantShell();
-  const acc = { content: '' };
+  const thinkingEnabled = thinkingToggle.checked;
+  const acc = { content: '', reasoning: '' };
   const t0 = performance.now();
   let tFirst = 0, chunks = 0, ds4Stats = null, usage = null, sawDone = false;
 
-  const renderNow = () => { mdRender(shell.bubble, acc.content); scrollBottom(); };
+  const renderAnswer = () => {
+    const children = [...shell.bubble.childNodes].filter(n => n === shell.thinkingPanel);
+    shell.bubble.textContent = '';
+    for (const child of children) shell.bubble.appendChild(child);
+    if (acc.content) {
+      const answer = el('div', 'answerBody');
+      mdRender(answer, acc.content);
+      shell.bubble.appendChild(answer);
+    }
+    scrollBottom();
+  };
+  const renderReasoning = () => {
+    shell.thinkingPanel.style.display = 'block';
+    shell.thinkingPanel.open = true;
+    mdRender(shell.thinkingBody, acc.reasoning);
+    shell.thinkingBody.scrollTop = shell.thinkingBody.scrollHeight;
+    scrollBottom();
+  };
 
   try {
     const res = await fetch(location.origin + '/v1/chat/completions', {
@@ -588,7 +698,12 @@ async function sendChat() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'ds4',
-        messages: chat.msgs.map(m => ({ role: m.role, content: m.content })),
+        messages: chat.msgs.map(m => {
+          const out = { role: m.role, content: m.content };
+          if (m.reasoning_content) out.reasoning_content = m.reasoning_content;
+          return out;
+        }),
+        reasoning_effort: thinkingEnabled ? 'high' : 'none',
         stream: true,
         stream_options: { include_usage: true }
       }),
@@ -617,11 +732,21 @@ async function sendChat() {
           if (j && typeof j === 'object' && j.ds4) { ds4Stats = j.ds4; continue; }
           if (j && j.usage) usage = j.usage;
           const delta = j && j.choices && j.choices[0] && j.choices[0].delta;
+          if (delta && typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+            if (!tFirst) { tFirst = performance.now(); shell.typing.remove(); }
+            chunks++;
+            acc.reasoning += delta.reasoning_content;
+            renderReasoning();
+            const elS = (performance.now() - t0) / 1000;
+            lbTokens.textContent = String(chunks);
+            lbElapsed.textContent = elS.toFixed(1) + 's';
+            lbTokS.textContent = (chunks / Math.max(elS, 0.001)).toFixed(1) + ' tok/s';
+          }
           if (delta && typeof delta.content === 'string' && delta.content) {
             if (!tFirst) { tFirst = performance.now(); shell.typing.remove(); }
             chunks++;
             acc.content += delta.content;
-            renderNow();
+            renderAnswer();
             const elS = (performance.now() - t0) / 1000;
             lbTokens.textContent = String(chunks);
             lbElapsed.textContent = elS.toFixed(1) + 's';
@@ -633,7 +758,7 @@ async function sendChat() {
   } catch (err) {
     if (err && err.name === 'AbortError') {
       if (!acc.content) { shell.typing.remove(); acc.content = '*stopped*'; }
-      renderNow();
+      renderAnswer();
     } else {
       shell.typing.remove();
       shell.bubble.textContent = '';
@@ -646,7 +771,12 @@ async function sendChat() {
     shell.bubble.textContent = '(empty response)';
   } else if (acc.content && shell.typing.parentNode) {
     shell.typing.remove();
-    renderNow();
+    renderAnswer();
+  }
+
+  if (acc.reasoning) {
+    shell.thinkingSummary.textContent = 'Thinking';
+    shell.thinkingPanel.open = false;
   }
 
   const totalS = (performance.now() - t0) / 1000;
@@ -660,7 +790,7 @@ async function sendChat() {
     completion_tokens: usage.completion_tokens
   } : null));
 
-  chat.msgs.push({ role: 'assistant', content: acc.content });
+  chat.msgs.push({ role: 'assistant', content: acc.content, reasoning_content: acc.reasoning });
   setSending(false);
   void sawDone;
 }
@@ -930,15 +1060,15 @@ setInterval(() => {
 /* ================= /experts grid (optional endpoint) ================= */
 const expertCanvas = $('expertGrid');
 const expertNote = $('expertGridNote');
+const expertTip = $('expertTip');
 let expertsAvail = false;
 let expertData = null;
-const heatMap = new Map();   /* flat idx -> smoothed heat */
-const flashMap = new Map();  /* flat idx -> 0..1 flash intensity */
-let heatMax = 1;
-let residentSet = new Set();
+const expertCache = new Map(); /* expert id -> { hits, misses } */
+let expertLayout = null;
 
-function setExpertsAvail(ok) {
+function setExpertsAvail(ok, message = 'waiting for per-expert cache activity') {
   expertsAvail = ok;
+  if (!ok) expertNote.textContent = message;
   expertNote.classList.toggle('show', !ok);
   expertCanvas.style.visibility = ok ? 'visible' : 'hidden';
 }
@@ -949,19 +1079,18 @@ async function pollExperts() {
     const r = await fetch('/experts');
     if (!r.ok) { if (r.status === 404) setExpertsAvail(false); return; }
     const j = await r.json();
-    if (!j || typeof j !== 'object' || !j.layers || !j.experts_per_layer) return;
+    if (!j || typeof j !== 'object' || !j.experts_per_layer) return;
     expertData = j;
-    residentSet = new Set(Array.isArray(j.resident) ? j.resident.filter(x => typeof x === 'number') : []);
-    const M = j.experts_per_layer;
-    for (const rec of (Array.isArray(j.heat) ? j.heat : [])) {
-      if (!Array.isArray(rec) || rec.length < 3) continue;
-      const flat = rec[0] * M + rec[1];
-      const v = (heatMap.get(flat) || 0) * 0.7 + rec[2];
-      heatMap.set(flat, v);
-      if (v > heatMax) heatMax = v;
-      flashMap.set(flat, 1);
+    if (!Array.isArray(j.cache)) {
+      setExpertsAvail(false, 'server restart required for per-expert cache telemetry');
+      return;
     }
-    if (!expertsAvail) setExpertsAvail(true);
+    expertCache.clear();
+    for (const rec of j.cache) {
+      if (!Array.isArray(rec) || rec.length < 3) continue;
+      expertCache.set(rec[0], { hits: rec[1], misses: rec[2] });
+    }
+    setExpertsAvail(expertCache.size > 0);
     drawExperts();
   } catch (e) {
     /* endpoint absent or network error — keep counters-only mode */
@@ -983,39 +1112,55 @@ function drawExperts() {
   if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
-  const N = expertData.layers, M = expertData.experts_per_layer;
-  const cw = W / M, ch = H / N;
-  const gap = cw > 6 && ch > 6 ? 1 : 0;
-  for (let l = 0; l < N; l++) {
-    for (let e = 0; e < M; e++) {
-      const flat = l * M + e;
-      const h = Math.min(1, (heatMap.get(flat) || 0) / heatMax);
-      const f = flashMap.get(flat) || 0;
-      const resident = residentSet.has(flat);
-      let r, g, b;
-      if (resident) {           /* green, brightness scales with heat */
-        const k = 0.25 + 0.75 * h;
-        r = 20 * k; g = 120 + 65 * k; b = 60 * k;
-      } else {                  /* gray (cold / on disk) */
-        const k = 0.14 + 0.45 * h;
-        r = 110 * k + 20; g = 118 * k + 20; b = 128 * k + 24;
-      }
-      if (f > 0.01) {           /* flash white, decays */
-        r += (255 - r) * f; g += (255 - g) * f; b += (255 - b) * f;
-      }
-      ctx.fillStyle = 'rgb(' + (r | 0) + ',' + (g | 0) + ',' + (b | 0) + ')';
-      ctx.fillRect(e * cw + gap / 2, l * ch + gap / 2, Math.max(0.5, cw - gap), Math.max(0.5, ch - gap));
+  const count = expertData.experts_per_layer;
+  const cols = Math.max(8, Math.min(count, Math.floor(W / 20)));
+  const rows = Math.ceil(count / cols);
+  const cw = W / cols, ch = H / rows;
+  const gap = Math.min(3, Math.max(1, Math.min(cw, ch) * .12));
+  let maxActivity = 1;
+  for (const v of expertCache.values()) maxActivity = Math.max(maxActivity, v.hits + v.misses);
+  expertLayout = { cols, rows, cw, ch, count };
+  for (let e = 0; e < count; e++) {
+    const v = expertCache.get(e) || { hits: 0, misses: 0 };
+    const total = v.hits + v.misses;
+    const hitRate = total ? v.hits / total : 0;
+    const activity = total ? .35 + .65 * Math.sqrt(total / maxActivity) : 0;
+    const x = (e % cols) * cw, y = Math.floor(e / cols) * ch;
+    if (!total) ctx.fillStyle = '#21262d';
+    else {
+      const missRate = 1 - hitRate;
+      const r = (35 + 205 * missRate) * activity;
+      const g = (65 + 135 * hitRate) * activity;
+      const b = (45 + 20 * hitRate) * activity;
+      ctx.fillStyle = `rgb(${r | 0},${g | 0},${b | 0})`;
+    }
+    ctx.fillRect(x + gap / 2, y + gap / 2,
+                 Math.max(1, cw - gap), Math.max(1, ch - gap));
+    if (cw >= 25 && ch >= 15) {
+      ctx.fillStyle = total ? '#fff' : '#768390';
+      ctx.font = '9px ui-monospace, monospace';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(e), x + cw / 2, y + ch / 2);
     }
   }
 }
-setInterval(() => {
-  let any = false;
-  for (const [k, v] of flashMap) {
-    const nv = v * 0.9;
-    if (nv < 0.02) flashMap.delete(k); else { flashMap.set(k, nv); any = true; }
-  }
-  if (any) drawExperts();
-}, 120);
+expertCanvas.addEventListener('mousemove', (ev) => {
+  if (!expertLayout) return;
+  const r = expertCanvas.getBoundingClientRect();
+  const col = Math.floor((ev.clientX - r.left) / expertLayout.cw);
+  const row = Math.floor((ev.clientY - r.top) / expertLayout.ch);
+  const e = row * expertLayout.cols + col;
+  if (e < 0 || e >= expertLayout.count) { expertTip.style.display = 'none'; return; }
+  const v = expertCache.get(e) || { hits: 0, misses: 0 };
+  const total = v.hits + v.misses;
+  const pct = total ? (v.hits / total * 100).toFixed(1) + '%' : 'no accesses';
+  expertTip.innerHTML = `<b>Expert ${e}</b><br><span style="color:var(--green)">hits ${fmtInt(v.hits)}</span> · <span style="color:var(--orange)">misses ${fmtInt(v.misses)}</span><br>hit rate ${pct}`;
+  expertTip.style.left = (ev.clientX + 12) + 'px';
+  expertTip.style.top = (ev.clientY + 12) + 'px';
+  expertTip.style.display = 'block';
+});
+expertCanvas.addEventListener('mouseleave', () => { expertTip.style.display = 'none'; });
+window.addEventListener('resize', drawExperts);
 </script>
 </body>
 </html>
