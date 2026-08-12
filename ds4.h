@@ -478,4 +478,26 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
+/* Expert routing telemetry snapshot for the web monitor (/experts endpoint).
+ * heat is a flat layers*experts array of per-cell routing counts normalized
+ * to 0..255 (255 = hottest cell overall); it may be NULL to skip the copy.
+ * top_layers/top_experts/top_counts receive the top_cells hottest cells,
+ * sorted by descending count; pass top_cells=0 to skip.  Returns the number
+ * of layers written (0 when the profiler is inactive or nothing recorded),
+ * and sets *experts to the experts-per-layer count.  Layer count is capped
+ * by the heat capacity; when heat is NULL the full active dimensions are
+ * still reported. */
+#define DS4_EXPERT_MAP_MAX_LAYER  79
+#define DS4_EXPERT_MAP_MAX_EXPERT 384
+int ds4_expert_map_snapshot(uint8_t *heat, uint32_t heat_layers,
+                            uint32_t *experts,
+                            uint32_t *top_layers, uint32_t *top_experts,
+                            uint32_t *top_counts, uint32_t top_cells);
+
+/* Activates the routed-expert locality profiler without any output file, so
+ * ds4_expert_map_snapshot() (the /experts endpoint) has live data.  Safe to
+ * call alongside --expert-profile/--hotlist; file output still applies.
+ * Must be called after the model shape is known (engine open). */
+void ds4_expert_map_enable(void);
+
 #endif

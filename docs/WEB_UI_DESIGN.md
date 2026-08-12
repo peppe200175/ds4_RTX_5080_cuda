@@ -71,7 +71,45 @@ Served from a C string (`ds4_web_ui.h`, generated or hand-written). Two tabs:
 
 ## Phasing
 
-1. **P1 — metrics core**: `ds4_metrics.h/.c`, `/health`, `/profile`, `/metrics/stream`, hooks. Build-only validation.
-2. **P2 — embedded UI**: chat tab + monitor tab consuming P1 endpoints.
-3. **P3 — expert map**: `/experts` endpoint + Brain-like canvas.
-4. **P4 — polish**: SSE trailer stats in chat stream, docs, README update.
+1. **P1 — metrics core**: `ds4_metrics.h/.c`, `/health`, `/profile`, `/metrics/stream`, hooks. ✅ shipped.
+2. **P2 — embedded UI**: chat tab + monitor tab consuming P1 endpoints. ✅ shipped (`web/index.html`).
+3. **P3 — expert map**: `/experts` endpoint + Brain-like canvas. ✅ shipped.
+4. **P4 — SSE trailer stats**: `{"ds4": {...}}` frame before `[DONE]`. ✅ shipped.
+
+## Implementation notes (as built)
+
+- `ds4_metrics.c/.h` — pthread-mutex collector; prompt ring (64), expert
+  hit/miss counters, hook-based disk bytes, and a `/proc/self/io` sampler
+  (`proc_read_bytes`, `proc_read_mbs`) so CPU/mmap streaming also reports disk
+  throughput. `ds4_metrics_latest_prompt()` feeds the SSE trailer.
+- Endpoints in `ds4_server.c` `client_main()` routing:
+  - `GET /health` → `{status, model, uptime_s, expert_cache:{hits,misses,hit_rate}, disk:{bytes_read,reads,total_read_s,avg_read_ms,throughput_mbs,proc_read_bytes,proc_read_mbs}}`.
+    `disk.throughput_mbs` falls back to the `/proc` rate when no backend hook fired.
+  - `GET /profile` → `{seq, prompts:[ds4_prompt_stat...]}` (newest first).
+  - `GET /metrics/stream` → SSE, one snapshot/second; `disk_mbs`/`disk_bytes`
+    fall back to `/proc` counters in CPU mode.
+  - `GET /experts` → `{layers, experts_per_layer, heat:[[layer,expert,heat0-255]...], top:[[layer,expert,count]...]}` (sparse heat; 404 until the first token is routed).
+  - `GET /` + `/index.html` → `web/index.html` (traversal-safe, read fresh).
+- Instrumentation:
+  - Per-prompt record in `trace_finish()` (prefill/TTFT/gen/tok-s, KV cache
+    tokens, expert hits/misses, disk bytes with `/proc` fallback).
+  - Expert hit/miss + pread timing hooks in `ds4_cuda.cu`
+    (`cuda_stream_selected_cache_begin_load`, `cuda_pread_full`) and the Metal
+    stream range reader in `ds4.c`.
+  - CPU expert routing recorded in `layer_routed_moe_one_prealloc()` via
+    `ds4_expert_profile_record()`; the profiler is enabled file-less at server
+    startup via `ds4_expert_map_enable()`, and exposed read-only through
+    `ds4_expert_map_snapshot()` (declared in `ds4.h`).
+- Chat SSE: `sse_done()` now emits `data: {"ds4": {...per-request stats...}}`
+  immediately before `data: [DONE]` for OpenAI-protocol streams (no-op for
+  Anthropic/Responses envelopes and when no prompt was recorded, so the
+  existing test-mode assertions are unaffected).
+
+### Known scope limits
+- `resident` per-cell VRAM residency is not tracked by the engine, so
+  `/experts` omits it; the UI renders heat-only cells as cold/gray.
+- On `--cpu`, expert hit/miss counters stay 0 (no explicit cache layer — mmap
+  plus OS page cache); disk metrics come from the `/proc/self/io` fallback.
+- `expert_hits`/`expert_misses` reflect the CUDA streaming cache; on CPU they
+  are 0 by design.
+

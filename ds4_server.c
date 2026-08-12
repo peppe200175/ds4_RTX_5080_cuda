@@ -5593,10 +5593,41 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
     return ok;
 }
 
+static bool sse_ds4_stats_chunk(int fd, const request *r);
+
 static bool sse_done(int fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens) {
     return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
+           sse_ds4_stats_chunk(fd, r) &&
            send_all(fd, "data: [DONE]\n\n", 14);
+}
+
+/* Emits the ds4 per-request telemetry frame immediately before [DONE],
+ * mirroring Colibri's {"colibri": {...}} convention.  OpenAI-protocol
+ * streams only (Anthropic/Responses envelopes use their own finish paths),
+ * and only when a prompt record exists — trace_finish() records it before
+ * the streaming tail is flushed. */
+static bool sse_ds4_stats_chunk(int fd, const request *r) {
+    if (!r || r->api != API_OPENAI) return true;
+    ds4_prompt_stat p;
+    if (!ds4_metrics_latest_prompt(&p)) return true;
+    buf b = {0};
+    buf_printf(&b,
+        "data: {\"ds4\":{\"tok_s\":%.2f,\"ttft_s\":%.4f,\"prefill_s\":%.4f,"
+        "\"gen_s\":%.4f,\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+        "\"cache_read_tokens\":%d,\"cache_write_tokens\":%d,"
+        "\"expert_hits\":%llu,\"expert_misses\":%llu,"
+        "\"disk_bytes\":%llu,\"disk_s\":%.4f}}\n\n",
+        p.tok_s, p.ttft_s, p.prefill_s, p.gen_s,
+        p.prompt_tokens, p.completion_tokens,
+        p.cache_read_tokens, p.cache_write_tokens,
+        (unsigned long long)p.expert_hits,
+        (unsigned long long)p.expert_misses,
+        (unsigned long long)p.disk_bytes,
+        p.disk_s);
+    const bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
 }
 
 static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
@@ -12895,6 +12926,53 @@ static void metrics_stream_main(server *s, int fd) {
     }
 }
 
+/* Expert routing heat map for the monitor's Brain-style view.  JSON shape
+ * matches web/index.html: heat is a sparse list of [layer, expert, heat]
+ * triples (heat 0..255, only non-zero cells), top carries the hottest cells
+ * as [layer, expert, count].  No "resident" array: ds4 keeps routing
+ * frequency, not per-cell VRAM residency, so the UI treats heat-only cells
+ * as cold/gray. */
+static void send_experts(server *s, int fd) {
+    uint8_t *heat = xmalloc((size_t)DS4_EXPERT_MAP_MAX_LAYER *
+                            DS4_EXPERT_MAP_MAX_EXPERT);
+    memset(heat, 0, (size_t)DS4_EXPERT_MAP_MAX_LAYER *
+                    DS4_EXPERT_MAP_MAX_EXPERT);
+    enum { TOP = 64 };
+    uint32_t top_l[TOP], top_e[TOP], top_c[TOP];
+    uint32_t n_expert = 0;
+    const int layers = ds4_expert_map_snapshot(heat, DS4_EXPERT_MAP_MAX_LAYER,
+                                               &n_expert,
+                                               top_l, top_e, top_c, TOP);
+    if (layers <= 0 || n_expert == 0) {
+        free(heat);
+        http_error(fd, s->enable_cors, 404, "no expert routing data yet");
+        return;
+    }
+
+    buf b = {0};
+    buf_printf(&b, "{\"layers\":%d,\"experts_per_layer\":%u,\"heat\":[",
+               layers, n_expert);
+    bool first = true;
+    for (int il = 0; il < layers; il++) {
+        for (uint32_t e = 0; e < n_expert; e++) {
+            const unsigned h = heat[(size_t)il * n_expert + e];
+            if (!h) continue;
+            if (!first) buf_putc(&b, ',');
+            first = false;
+            buf_printf(&b, "[%d,%u,%u]", il, e, h);
+        }
+    }
+    buf_puts(&b, "],\"top\":[");
+    for (int i = 0; i < TOP && top_c[i]; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "[%u,%u,%u]", top_l[i], top_e[i], top_c[i]);
+    }
+    buf_puts(&b, "]}\n");
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    free(heat);
+}
+
 /* Traversal-safe: serves only the literal web/index.html relative to the
  * current working directory, read fresh on every request. */
 static void send_index_html(server *s, int fd) {
@@ -13014,6 +13092,11 @@ static void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics/stream")) {
         metrics_stream_main(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/experts")) {
+        send_experts(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -13567,6 +13650,11 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+
+    /* The expert routing profiler powers the monitor's /experts heat map.
+     * Enable it unconditionally (no output file); the per-token overhead is a
+     * few histogram increments. */
+    ds4_expert_map_enable();
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {

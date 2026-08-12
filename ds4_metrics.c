@@ -151,3 +151,18 @@ int ds4_metrics_get_prompts(ds4_prompt_stat *out, int max) {
     pthread_mutex_unlock(&g_metrics_mu);
     return n;
 }
+
+bool ds4_metrics_latest_prompt(ds4_prompt_stat *out) {
+    if (!out) return false;
+    ds4_metrics_init();
+    bool ok;
+    pthread_mutex_lock(&g_metrics_mu);
+    ok = g_prompts_len > 0;
+    if (ok) {
+        int idx = g_prompts_head - 1;
+        if (idx < 0) idx += DS4_METRICS_PROMPT_CAPACITY;
+        *out = g_prompts[idx];
+    }
+    pthread_mutex_unlock(&g_metrics_mu);
+    return ok;
+}

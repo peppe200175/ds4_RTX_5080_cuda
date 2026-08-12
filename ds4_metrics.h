@@ -59,6 +59,11 @@ void ds4_metrics_get_snapshot(ds4_metrics_snapshot *out);
  * of entries written. */
 int ds4_metrics_get_prompts(ds4_prompt_stat *out, int max);
 
+/* Copies the most recently recorded prompt into out.  Returns false when no
+ * prompt has been recorded yet.  Intended for the end-of-stream stats frame:
+ * trace_finish() records the prompt before the SSE tail is sent. */
+bool ds4_metrics_latest_prompt(ds4_prompt_stat *out);
+
 #ifdef __cplusplus
 }
 #endif
