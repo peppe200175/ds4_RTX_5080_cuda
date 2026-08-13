@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_metrics.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -18487,6 +18488,7 @@ static bool metal_graph_stream_pread_range(
     }
     if (offset > (uint64_t)LLONG_MAX) return false;
 
+    const double read_t0 = now_sec();
     const size_t chunk = 1024u * 1024u;
     uint8_t *buf = xmalloc(chunk);
     uint64_t pos = offset;
@@ -18512,6 +18514,7 @@ static bool metal_graph_stream_pread_range(
                 UINT64_MAX : *read_bytes + (uint64_t)nread;
         }
     }
+    if (ok) ds4_metrics_disk_read(size, now_sec() - read_t0);
     if (sink) *sink = s;
     free(buf);
     return ok;
