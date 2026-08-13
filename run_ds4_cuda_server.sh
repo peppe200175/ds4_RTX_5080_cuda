@@ -30,9 +30,9 @@ exec ./ds4-server \
     --cuda \
     -m "$script_dir/ds4flash.gguf" \
     --ssd-streaming \
-    --ssd-streaming-cache-experts "${DS4_SERVER_EXPERT_CACHE:-8GB}" \
+    --ssd-streaming-cache-experts "${DS4_SERVER_EXPERT_CACHE:-7GB}" \
     --prefill-chunk "${DS4_SERVER_PREFILL_CHUNK:-1024}" \
-    --ctx "${DS4_SERVER_CTX:-4096}" \
+    --ctx "${DS4_SERVER_CTX:-135168}" \
     --host "${DS4_SERVER_HOST:-127.0.0.1}" \
     --port "${DS4_SERVER_PORT:-18099}" \
     --cors \
