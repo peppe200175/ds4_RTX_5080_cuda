@@ -40,7 +40,7 @@ Compared with the upstream revision from which it was created, this fork adds:
   paths remain opt-in or correctness-gated where exact output has not yet been
   established.
 
-The fork currently consists of three focused commits on top of upstream:
+The fork began with three focused commits on top of upstream:
 
 - `server: restore web chat and monitoring on verified core`
 - `cuda: add correctness-gated persistent expert cache`
