@@ -399,6 +399,40 @@ __global__ static void repack_q2_k_aligned_kernel(
     }
 }
 
+bool ds4_repack_iq2_xxs_aligned_into(
+        const void *raw, void *dq, void *qs, uint64_t nblk,
+        cudaStream_t stream) {
+    if (!raw || !dq || !qs || nblk == 0 || nblk > UINT64_MAX / 8u) {
+        return false;
+    }
+    const uint64_t threads = nblk * 8u;
+    const uint64_t blocks = threads / 256u + (threads % 256u != 0u);
+    if (blocks > UINT_MAX) return false;
+    repack_iq2_xxs_aligned_kernel<<<(unsigned)blocks, 256, 0, stream>>>(
+        (__half *)dq, (uint2 *)qs, (const unsigned char *)raw, nblk);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool ds4_repack_q2_k_aligned_into(
+        const void *raw, void *dm, void *sc, void *qs,
+        uint32_t rows, uint32_t cols, cudaStream_t stream) {
+    if (!raw || !dm || !sc || !qs || rows == 0 || (rows & 1u) != 0u ||
+        cols == 0 || cols % 256u != 0u) {
+        return false;
+    }
+    const uint64_t nb_row = cols / 256u;
+    if ((uint64_t)rows > UINT64_MAX / nb_row) return false;
+    const uint64_t nblk = (uint64_t)rows * nb_row;
+    if (nblk > UINT64_MAX / 16u) return false;
+    const uint64_t threads = nblk * 16u;
+    const uint64_t blocks = threads / 256u + (threads % 256u != 0u);
+    if (blocks > UINT_MAX) return false;
+    repack_q2_k_aligned_kernel<<<(unsigned)blocks, 256, 0, stream>>>(
+        (uint32_t *)dm, (uint32_t *)sc, (uint32_t *)qs,
+        (const unsigned char *)raw, 0u, nblk, (uint32_t)nb_row, rows);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 /* One thread per (block, 16B half of the 32B code payload); p==0 additionally
  * splits out the block scale.  Source raw block_q8_0 is 34 bytes =
  * [half d][32 x int8 codes]. */

@@ -50,6 +50,8 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *dump_frontier_layer_payload_dir;
+    int dump_frontier_layer;
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
@@ -207,6 +209,7 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
+        .dump_frontier_layer = -1,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -258,6 +261,11 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-frontier-layer-payload-dir")) {
+            c.dump_frontier_layer_payload_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-frontier-layer")) {
+            c.dump_frontier_layer =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -337,6 +345,13 @@ static bench_config parse_options(int argc, char **argv) {
 
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+        exit(2);
+    }
+    if (!!c.dump_frontier_layer_payload_dir !=
+        (c.dump_frontier_layer >= 0)) {
+        fprintf(stderr,
+                "ds4-bench: --dump-frontier-layer-payload-dir and "
+                "--dump-frontier-layer must be specified together\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -465,6 +480,118 @@ static int write_frontier_logits_json(
         return 1;
     }
     free(logits);
+    return 0;
+}
+
+static int write_frontier_layer_payload(
+        const bench_config *cfg,
+        ds4_session        *session,
+        int                 frontier) {
+    if (!cfg->dump_frontier_layer_payload_dir) return 0;
+
+    char path[PATH_MAX];
+    char tmp_path[PATH_MAX];
+    const int n = snprintf(path,
+                           sizeof(path),
+                           "%s/frontier_%d.layer_%d.payload.bin",
+                           cfg->dump_frontier_layer_payload_dir,
+                           frontier,
+                           cfg->dump_frontier_layer);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "ds4-bench: frontier layer payload path is too long\n");
+        return 1;
+    }
+    const int tn = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    if (tn <= 0 || (size_t)tn >= sizeof(tmp_path)) {
+        fprintf(stderr, "ds4-bench: frontier layer payload temporary path is too long\n");
+        return 1;
+    }
+
+    FILE *fp = fopen(tmp_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                tmp_path, strerror(errno));
+        return 1;
+    }
+
+    char err[256] = {0};
+    const uint32_t layer = (uint32_t)cfg->dump_frontier_layer;
+    if (ds4_session_save_layer_payload(session, fp, layer, layer,
+                                       err, sizeof(err)) != 0) {
+        fprintf(stderr,
+                "ds4-bench: failed to save frontier %d layer %u payload: %s\n",
+                frontier,
+                layer,
+                err[0] ? err : "unknown error");
+        fclose(fp);
+        remove(tmp_path);
+        return 1;
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4-bench: failed to close %s: %s\n",
+                tmp_path, strerror(errno));
+        remove(tmp_path);
+        return 1;
+    }
+    if (rename(tmp_path, path) != 0) {
+        fprintf(stderr, "ds4-bench: failed to rename %s to %s: %s\n",
+                tmp_path, path, strerror(errno));
+        remove(tmp_path);
+        return 1;
+    }
+    return 0;
+}
+
+/* Keep greedy continuations machine-readable whenever frontier logits are
+ * requested.  The benchmark already retains these ids for --show-output;
+ * this sidecar lets correctness harnesses compare tokens without scraping
+ * decoded UTF-8 text or adding another command-line surface. */
+static int write_frontier_tokens_json(
+        const bench_config *cfg,
+        int                 frontier,
+        const int          *token_ids,
+        int                 token_count) {
+    if (!cfg->dump_frontier_logits_dir) return 0;
+    if (token_count < 0 || (token_count > 0 && !token_ids)) return 1;
+
+    char path[PATH_MAX];
+    const int n = snprintf(path,
+                           sizeof(path),
+                           "%s/frontier_%06d.tokens.json",
+                           cfg->dump_frontier_logits_dir,
+                           frontier);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "ds4-bench: frontier tokens path is too long\n");
+        return 1;
+    }
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                path, strerror(errno));
+        return 1;
+    }
+    fprintf(fp,
+            "{\n  \"source\":\"ds4-bench\",\n"
+            "  \"schema_version\":1,\n"
+            "  \"frontier_tokens\":%d,\n"
+            "  \"requested_tokens\":%d,\n"
+            "  \"generated_tokens\":%d,\n"
+            "  \"eos_excluded\":true,\n"
+            "  \"token_ids\":[",
+            frontier,
+            cfg->gen_tokens,
+            token_count);
+    for (int i = 0; i < token_count; i++) {
+        if (i) fputc(',', fp);
+        fprintf(fp, "%d", token_ids[i]);
+    }
+    fputs("]\n}\n", fp);
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4-bench: failed to close %s: %s\n",
+                path, strerror(errno));
+        return 1;
+    }
     return 0;
 }
 
@@ -616,6 +743,14 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
     }
+    if (cfg.dump_frontier_layer >= ds4_engine_layer_count(engine)) {
+        fprintf(stderr,
+                "ds4-bench: --dump-frontier-layer=%d is outside model layer range [0,%d)\n",
+                cfg.dump_frontier_layer,
+                ds4_engine_layer_count(engine));
+        ds4_engine_close(engine);
+        return 2;
+    }
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,
                        ds4_engine_prefill_chunk(engine),
@@ -697,6 +832,10 @@ int main(int argc, char **argv) {
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
 
+        if (write_frontier_layer_payload(&cfg, session, frontier) != 0) {
+            rc = 1;
+            break;
+        }
         if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
             rc = 1;
             break;
@@ -733,7 +872,9 @@ int main(int argc, char **argv) {
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
         int gen_done = 0;
-        int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
+        int *gen_token_buf =
+            (cfg.show_output || cfg.dump_frontier_logits_dir) &&
+            cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
@@ -774,6 +915,11 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "\"\n");
             fflush(stderr);
+        }
+        if (rc == 0 &&
+            write_frontier_tokens_json(&cfg, frontier,
+                                       gen_token_buf, gen_token_count) != 0) {
+            rc = 1;
         }
         free(gen_token_buf);
         if (rc != 0) break;

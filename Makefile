@@ -21,6 +21,8 @@ DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+DS4_AUTOTUNE_OUTPUT ?= .cache/flash-iq2-q2-prefill-autotune.json
+DS4_AUTOTUNE_ARGS ?=
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -62,7 +64,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-flash-moe-decode bench-cuda-flash-moe-decode test-cuda-q8-batch-decode-exact autotune-cuda-flash-iq2-q2-prefill check-autotune-cuda-flash-iq2-q2-prefill test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -154,6 +156,11 @@ help:
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
+	@echo "  make test-cuda-flash-moe-decode  Check SM120 Flash IQ2/Q2 decode exactness"
+	@echo "  make bench-cuda-flash-moe-decode Benchmark SM120 Flash IQ2/Q2 decode"
+	@echo "  make test-cuda-q8-batch-decode-exact Check Q8 batch decode byte identity"
+	@echo "  make autotune-cuda-flash-iq2-q2-prefill Run offline diagnostic Flash IQ2/Q2 prefill autotune"
+	@echo "  make check-autotune-cuda-flash-iq2-q2-prefill Check the offline autotune/cache tool (host only)"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -221,6 +228,37 @@ tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 
 test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
+
+tests/test_cuda_flash_moe_decode.o: tests/test_cuda_flash_moe_decode.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+tests/test_cuda_flash_moe_decode: tests/test_cuda_flash_moe_decode.o ds4_cuda.o ds4_metrics.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-cuda-flash-moe-decode: tests/test_cuda_flash_moe_decode
+	./tests/test_cuda_flash_moe_decode --correctness
+
+bench-cuda-flash-moe-decode: tests/test_cuda_flash_moe_decode
+	./tests/test_cuda_flash_moe_decode --bench
+
+tests/test_cuda_q8_batch_decode_exact.o: tests/test_cuda_q8_batch_decode_exact.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+tests/test_cuda_q8_batch_decode_exact: tests/test_cuda_q8_batch_decode_exact.o ds4_cuda.o ds4_metrics.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-cuda-q8-batch-decode-exact: tests/test_cuda_q8_batch_decode_exact
+	./tests/test_cuda_q8_batch_decode_exact
+
+autotune-cuda-flash-iq2-q2-prefill: ds4-bench
+	python3 tests/autotune_flash_iq2_q2_prefill.py \
+		--binary ./ds4-bench --model "$(DS4_TEST_MODEL)" \
+		--cuda-arch "$(CUDA_ARCH)" --compute-capability "$(CUDA_ARCH)" \
+		--output "$(DS4_AUTOTUNE_OUTPUT)" $(DS4_AUTOTUNE_ARGS)
+
+check-autotune-cuda-flash-iq2-q2-prefill:
+	python3 -m py_compile tests/autotune_flash_iq2_q2_prefill.py
+	python3 tests/autotune_flash_iq2_q2_prefill.py --self-test
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_metrics.h
@@ -462,6 +500,10 @@ dspark-acceptance: ds4
 	DS4_DSPARK_SUPPORT="$(DS4_DSPARK_SUPPORT)" \
 	sh tests/dspark_acceptance_fixture.sh
 
+.PHONY: test-server-adherence
+test-server-adherence:
+	./tests/test_server_prompt_adherence.sh
+
 dspark-verify-depth: ds4_test
 	@if [ ! -f "$(DS4_TEST_MODEL)" ]; then \
 		echo "dspark-verify-depth: skipped, missing model $(DS4_TEST_MODEL)"; \
@@ -491,4 +533,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_cuda_flash_moe_decode tests/test_cuda_q8_batch_decode_exact tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

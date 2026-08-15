@@ -226,6 +226,11 @@ int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
+/* Switch SSD expert memory between batch-prefill staging and decode cache.
+ * A no-op unless DS4_CUDA_DYNAMIC_PREFILL_DECODE_CACHE=1 and a bounded
+ * DS4_CUDA_DYNAMIC_DECODE_CACHE_GB target are both configured. */
+void ds4_engine_streaming_cache_prefill_phase(ds4_engine *e);
+void ds4_engine_streaming_cache_decode_phase(ds4_engine *e);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,

@@ -101,11 +101,11 @@ numbers in the QA report so omissions are visible.
    impossible dimensions, and overflowing tensor sizes must be rejected.
 5. With a checkpoint-matched DSpark drafter, compare temperature-zero output
    against a no-drafter run for 400 and 800 generated tokens. Record the first
-   output difference, acceptance, direct commits, replay fallbacks, and decode
-   speed. Byte identity is not required: DSpark commits the batched verifier
-   state, whose floating-point operation order differs from one-token decode.
-   Verifier errors, invalid text, or a material continuation-quality regression
-   remain release blockers. Use `--dspark-strict` for the target-only control.
+   output difference, exact commits, authoritative rejections, and decode
+   speed. Byte identity is required: production verifies at most two proposals
+   per cycle and accepts each one only when it matches the current ordinary
+   one-token target argmax. Any token difference or verifier error is a release
+   blocker. Use `--dspark-strict` for the proposal-disabled control.
 6. Exercise unterminated and twice-closed reasoning in streaming and
    non-streaming OpenAI, Responses, and Anthropic requests, with and without
    tools. Reasoning must never leak into answer content.
@@ -222,27 +222,29 @@ Use the 0731 DSpark support GGUF only with a Flash 0731 target. A support model
 from another checkpoint can have plausible acceptance statistics while
 producing a different greedy continuation.
 
-Normal DSpark runs commit accepted target-verifier state directly. The batched
-verifier and one-token decode use the same graph with different floating-point
-operation order, so `output_match=0` against the baseline is diagnostic rather
-than a failure. `--dspark-strict` remains the byte-identical target-only mode.
+Normal DSpark runs use authoritative sequential target verification. At most
+two proposed tokens are checked per cycle, each against the exact current
+one-token target argmax, and only ordinary decode state is committed.
+`output_match=1` against the greedy baseline is mandatory. `--dspark-strict`
+remains the proposal-disabled target-only control.
 
 - Default greedy acceptance fixture:
   `DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - 64-token guardrail:
   `DS4_DSPARK_FIXTURE_TOKENS=64 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
-- Fixed-block direct partial commit:
+- Fixed-proposal partial-acceptance coverage:
   `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
   `DS4_TEST_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
 - If shared support-model or verifier structures changed, also run legacy MTP:
   `make mtp-verify-depth` with `DS4_TEST_MTP` set to a one-stage MTP support
   GGUF, or confirm the target skips only because the optional file is missing.
-- Record `c_add` `accepted_draft`, `direct_full`, `direct_partial`,
-  `replay_fallbacks`, `errors=0`, `verify_layer`, `net_saved`, and
-  `output_match` for both 32-token and 64-token runs. At least one direct commit
-  must occur. A faster run with lower proposal quality is a regression unless
-  it was an intentional scheduler change.
+- Record `c_add` `accepted_draft`, `exact_commits`,
+  `authoritative_rejects`, `errors=0`, `target`, `saved=0`, `net_saved`, and
+  `output_match` for both 32-token and 64-token runs. Require
+  `output_match=1`, and confirm no speculative cycle returns more than the
+  first target token plus two verified drafts. A faster run with lower proposal
+  quality is a regression unless it was an intentional scheduler change.
 - If verifier MoE kernels changed, run one diagnostic `c_add` profile with
   `DS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the Metal MoE stage profiler and
   record the selected-expert footprint or stage timing in the DSpark log.
@@ -477,13 +479,11 @@ a substitute for CUDA or Metal release testing.
   GLM and `--quality` must stay on the full-FP32 activation path.
 - Test DSpark with the matched 0731 target and support files:
   `DS4_BIN=./ds4 DS4_DSPARK_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf DS4_DSPARK_FIXTURE_TOKENS=64 sh tests/dspark_acceptance_fixture.sh`.
-  Require proposals, accepted draft tokens, at least one direct state commit,
-  zero verifier errors, and zero replay fallbacks. Record ordinary and DSpark
-  generation speed separately. When direct verifier-state handling changes,
-  also compare with a test-only build of its immediate replay predecessor; the
-  direct build must be faster. DSpark is not currently expected to beat
-  ordinary ROCm decode, so do not describe it as a ROCm speedup without a new
-  measurement.
+  Require proposals, accepted draft tokens, exact output identity, and zero
+  verifier errors. Record `exact_commits`, `authoritative_rejects`, and ordinary
+  versus DSpark generation speed separately. The sequential authoritative path
+  includes proposal overhead and is not currently expected to beat ordinary
+  ROCm decode, so do not describe it as a speedup without a new measurement.
 - Run one longer prompt if ROCm kernels, backend hooks, tensor loading, model
   cache, KV cache, or graph prefill code changed.
 - Run the GLM Q2 release model through ROCm SSD streaming with at least four
@@ -638,10 +638,10 @@ claims across different models or contexts.
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token context | about 94 t/s | 15.4 t/s |
 | DGX Spark GB10, CUDA | Flash q2, 7,047-token prompt | 343.81 t/s | 13.75 t/s |
-| DGX Spark GB10, CUDA | Flash q2 DSpark, 64-token C fixture | - | 24.48 t/s direct; 13.93 t/s replay predecessor |
+| DGX Spark GB10, CUDA | Flash q2 DSpark, 64-token C fixture (historical retired batch-commit path) | - | 24.48 t/s batch commit; 13.93 t/s replay predecessor |
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, short section 9 smoke | - | 17.27 t/s; FP32 rollback 9.70 t/s |
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, 4,096-token context | - | 14.82 t/s; FP32 rollback 8.76 t/s |
-| Strix Halo gfx1151, ROCm | Flash IQ2 DSpark, 64-token C fixture | - | 11.40 t/s direct; 9.77 t/s replay predecessor; 16.70 t/s ordinary |
+| Strix Halo gfx1151, ROCm | Flash IQ2 DSpark, 64-token C fixture (historical retired batch-commit path) | - | 11.40 t/s batch commit; 9.77 t/s replay predecessor; 16.70 t/s ordinary |
 | 8x L40S, CUDA TP | Flash q4, 2,048-token prefill benchmark | 1,524.84 t/s | 46.93 t/s |
 | 8x L40S, CUDA TP | Flash q4, 16-row decode oracle | - | 126.0 aggregate t/s |
 

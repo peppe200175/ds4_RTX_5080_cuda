@@ -6169,10 +6169,10 @@ static void test_tool_call_quality(void) {
 }
 
 /* Greedy speculative decode: capture committed tokens and the largest accepted
- * chunk, so the caller can confirm the multi-row verify path actually ran. */
+ * chunk, so the caller can confirm that at least one proposal was accepted. */
 static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *prompt,
-                                         int max_tokens, int *out, int *out_len,
-                                         int *max_chunk) {
+                                          int max_tokens, int *out, int *out_len,
+                                          int *max_chunk) {
     *out_len = 0;
     *max_chunk = 0;
     ds4_session *session = NULL;
@@ -6201,6 +6201,36 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
             if (toks[j] == eos) { stop = true; break; }
             out[n++] = toks[j];
             if (n >= max_tokens) { stop = true; break; }
+        }
+    }
+
+    *out_len = n;
+    ds4_session_free(session);
+    return ok;
+}
+
+static bool test_capture_greedy_tokens(ds4_engine *engine,
+                                       const ds4_tokens *prompt,
+                                       int max_tokens,
+                                       int *out,
+                                       int *out_len) {
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    if (!session) return false;
+
+    char err[160];
+    bool ok = ds4_session_sync(session, prompt, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+
+    const int eos = ds4_token_eos(engine);
+    int n = 0;
+    while (ok && n < max_tokens) {
+        const int token = ds4_session_argmax(session);
+        if (token == eos) break;
+        out[n++] = token;
+        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            ok = false;
+            TEST_ASSERT(false);
         }
     }
 
@@ -6242,8 +6272,7 @@ static bool test_mtp_worst_argmax_gap(ds4_engine *engine, const ds4_tokens *prom
 }
 
 /* Verbatim-copy task: keeps the model confident (a mis-committed token shows as
- * a large argmax gap) and draft acceptance high (so the multi-row verify path is
- * exercised across the generation). */
+ * a large argmax gap) and draft acceptance high across the generation. */
 static const char *test_mtp_copy_prompt(void) {
     return
         "Reproduce the following C code EXACTLY, character for character, "
@@ -6346,10 +6375,9 @@ static void test_mtp_verify_depth(void) {
     ds4_tokens_free(&prompt);
 }
 
-/* Same invariant as the MTP depth smoke, but for the DSpark support model.  This
- * is separate from the fixture because it teacher-forces every committed token
- * through normal decode and directly checks that DSpark never commits a token
- * that was not near the target argmax. */
+/* DSpark production must emit exactly the ordinary target's greedy stream.
+ * Near-argmax is not sufficient: a batch-reduction drift that changes even one
+ * token is a correctness failure, regardless of how small the logit gap is. */
 static void test_dspark_verify_depth(void) {
     const char *support = getenv("DS4_TEST_DSPARK");
     if (!support || !support[0]) {
@@ -6363,6 +6391,7 @@ static void test_dspark_verify_depth(void) {
     ds4_engine *engine = test_open_dspark_engine(support);
     ds4_tokens prompt = {0};
     int *spec = NULL;
+    int *base = NULL;
 
     if (engine) {
         const int draft_depth = ds4_engine_mtp_draft_tokens(engine);
@@ -6374,8 +6403,9 @@ static void test_dspark_verify_depth(void) {
         TEST_ASSERT(prompt.len > 0);
 
         spec = malloc((size_t)TEST_DSPARK_MAXGEN * sizeof(*spec));
-        TEST_ASSERT(spec != NULL);
-        if (draft_depth > 2 && spec && prompt.len > 0) {
+        base = malloc((size_t)TEST_DSPARK_MAXGEN * sizeof(*base));
+        TEST_ASSERT(spec != NULL && base != NULL);
+        if (draft_depth > 2 && spec && base && prompt.len > 0) {
             int nspec = 0, max_chunk = 0;
             const bool ok_spec = test_mtp_capture_speculative(engine, &prompt,
                                                               TEST_DSPARK_MAXGEN,
@@ -6383,22 +6413,30 @@ static void test_dspark_verify_depth(void) {
                                                               &max_chunk);
             TEST_ASSERT(ok_spec);
             TEST_ASSERT(max_chunk > 1);
+            TEST_ASSERT(max_chunk <= 3); /* first target token + at most two exact drafts */
             TEST_ASSERT(nspec > 64);
 
-            float worst_gap = 0.0f;
-            int worst_at = -1;
-            const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt,
-                                                            spec, nspec,
-                                                            &worst_gap,
-                                                            &worst_at);
-            TEST_ASSERT(ok_check);
+            int nbase = 0;
+            const bool ok_base = test_capture_greedy_tokens(
+                    engine, &prompt, TEST_DSPARK_MAXGEN, base, &nbase);
+            TEST_ASSERT(ok_base);
+            int mismatch_at = -1;
+            const int common = nspec < nbase ? nspec : nbase;
+            for (int i = 0; i < common; i++) {
+                if (spec[i] != base[i]) {
+                    mismatch_at = i;
+                    break;
+                }
+            }
+            if (mismatch_at < 0 && nspec != nbase) mismatch_at = common;
             fprintf(stderr,
-                    "ds4-test: dspark-verify-depth nspec=%d max_chunk=%d draft_depth=%d worst_argmax_gap=%.3f at=%d\n",
-                    nspec, max_chunk, draft_depth, worst_gap, worst_at);
-            TEST_ASSERT(worst_gap <= 2.0f);
+                    "ds4-test: dspark-verify-depth nspec=%d nbase=%d max_chunk=%d draft_depth=%d mismatch_at=%d\n",
+                    nspec, nbase, max_chunk, draft_depth, mismatch_at);
+            TEST_ASSERT(mismatch_at < 0);
         }
     }
 
+    free(base);
     free(spec);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
@@ -6432,7 +6470,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
-    {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
+    {"--dspark-verify-depth", "dspark-verify-depth", "DSpark authoritative verify emits the exact target greedy stream", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

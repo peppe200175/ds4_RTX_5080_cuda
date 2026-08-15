@@ -1,99 +1,494 @@
+# DwarfStar RTX 5080 CUDA Fork
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
-**DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
-machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
-not a general GGUF runner. Model loading, prompt rendering, tool calls, KV
-state, the HTTP server, and the coding agent are built and tested together.
-The repository also includes tools and data for GGUF, imatrix, quality, and speed.
+This repository is the
+[`peppe200175/ds4_RTX_5080_cuda`](https://github.com/peppe200175/ds4_RTX_5080_cuda)
+fork of [antirez/ds4](https://github.com/antirez/ds4). It keeps DwarfStar's
+small, model-specific inference engine and adds an operational path tested on a
+Linux laptop with an **NVIDIA GeForce RTX 5080 Laptop GPU (Blackwell, sm_120)**.
 
-Supported backends:
+The fork is intended for people who want to run DeepSeek V4 Flash locally from
+a fast SSD when the complete model cannot live in VRAM. Its main service is a
+local OpenAI-, Responses-, and Anthropic-compatible HTTP server with an
+integrated browser chat and live expert-cache monitor.
 
-* **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
-  can use SSD streaming.
-* **NVIDIA CUDA**, including multi-GPU systems and DGX Spark.
-* **ROCm** on Strix Halo systems such as the Framework Desktop.
+This is not a general GGUF runner and it is not a replacement for the main DS4
+project. The supported model layouts, prompt format, kernels, KV state, server,
+and tools are developed as one system. Read the upstream reference in the
+second half of this document before trying an unlisted model or quantization.
 
-This project would not exist without **llama.cpp and GGML**, make sure to read
-the acknowledgements section, a big thank you to Georgi Gerganov and all the
-other contributors.
+## What This Fork Adds
 
-Model support is intentionally opportunistic. The project follows the best open
-weights for useful local machine sizes, especially 128 GB laptops and 512 GB
-workstations. A model may be removed when a better replacement arrives.
+Compared with the upstream revision from which it was created, this fork adds:
 
-# So, what can I do with this software?
+- A correctness-gated persistent CUDA expert cache for SSD-streamed inference.
+  Frequently used routed experts remain in VRAM and are replaced with an LRU
+  policy only after the established loader has produced valid data.
+- A tested single-GPU RTX 5080 launch profile in
+  `run_ds4_cuda_server.sh`, including conservative correctness settings,
+  SSD streaming, disk KV checkpoints, and expert-map
+  telemetry.
+- A self-contained browser UI at the server root with chat, reasoning display,
+  per-request statistics, server controls, throughput charts, cumulative cache
+  hit/miss counters, and a live layer-by-expert activity map.
+- Monitoring endpoints for health, prompt profiles, expert residency, and a
+  one-second Server-Sent Events metrics stream.
+- CUDA correctness and performance work used by this hardware profile. Fast
+  paths remain opt-in or correctness-gated where exact output has not yet been
+  established.
 
-* You can run a very capable models in your consumer hardware, a MacBook, a DGX Spark, or a Strix Halo for example. Even if you have not enough RAM, with SSD streaming, you can run it at a decent speed.
-* Using the CUDA multi-GPU support and with ds4-server micro batching of decoding and generation, you can turn a server with old-ish CUDA cards (Ada Lovelace architecture), no longer supported for new models by vLLM, into a multi-user LLM server for your company. We tested this setup with 8xL40S NVIDIA cards and multiple sessions with very good results. 120 t/s aggreated generation, 2000 t/s prefill.
-* Using two MacBook M5 Max / M3 Ultra RDMA, you can run 4 bit DeepSeek Flash or GLM 5.2 with tensor parallelism.
-* You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
+The fork currently consists of three focused commits on top of upstream:
 
-## Motivations
+- `server: restore web chat and monitoring on verified core`
+- `cuda: add correctness-gated persistent expert cache`
+- `server: default to 7GB expert budget and 132K context`
 
-* Capable open-weight models now fit on high-end personal machines.
-* DeepSeek V4 Flash and PRO, GLM 5.2, tolerate aggressive routed-expert quantization.
-* Compressed KV caches and fast local SSDs make long contexts practical.
-* The idea of an inference system specialized for a few models.
+## Current Status
 
-# AI full disclosure
+The project is beta software and changes quickly. The primary fork profile is:
 
-* This software is developed with **strong assistance from GPT 5.5, 5.6, Claude Fable** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
+| Component | Tested/default fork configuration |
+| --- | --- |
+| Operating system | Linux |
+| GPU | NVIDIA GeForce RTX 5080 Laptop GPU, `sm_120` |
+| Backend | CUDA, single GPU |
+| Main model | DeepSeek V4 Flash through `ds4flash.gguf` |
+| Storage mode | SSD-streamed routed experts |
+| Context | 135,168 tokens by default |
+| Expert budget | 7 GiB total by default |
+| HTTP address | `http://127.0.0.1:18099` |
+| Disk KV budget | 4 GiB under `.cache/server-kv` |
 
-## Acknowledgements to llama.cpp and GGML
+Metal, ROCm, CPU diagnostics, distributed inference, and multi-GPU CUDA remain
+part of inherited DS4 and are documented later. They are not the primary test
+surface of this fork. Preserve correctness first: a higher benchmark number is
+not useful if continuation or prompt-adherence tests drift.
 
-`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
-llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
-engineering knowledge developed there**.
-We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
-and its contributors. Their implementation, kernels, tests, and design choices were
-an essential reference while building this DeepSeek V4 specific inference path.
-Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
-reason, and because we are genuinely grateful, we keep the GGML authors copyright
-notice in our `LICENSE` file.
+## Quick Start: RTX 5080
 
-## Status
+### 1. Clone With the Upstream Remote
 
-The software is currently very fast changing. Consider it beta quality.
-Before each release, a big QA run is executed, however instabilities
-are definitely possible.
+```sh
+git clone https://github.com/peppe200175/ds4_RTX_5080_cuda.git
+cd ds4_RTX_5080_cuda
+git remote add upstream https://github.com/antirez/ds4.git
+```
 
-# How to use this project?
+The `upstream` remote is optional for running the software, but useful when
+following new work from the main DS4 project.
 
-I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
+### 2. Install and Select CUDA
 
-1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
-2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
+Use an NVIDIA driver and CUDA toolkit new enough to compile Blackwell
+`sm_120`. A C compiler, GNU Make, Bash, Python 3, and `curl` are also useful for
+the build, tests, and model downloader. Confirm the toolchain before building:
 
-So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
+```sh
+nvidia-smi
+nvcc --version
+```
 
-## More Documentation
+The provided server script defaults `CUDA_HOME` to the path used by the fork
+author. Override it on other systems:
 
-If you are looking for very specific things, we have other
-sub-README files. Otherwise for normal usage keep reading the
-next sections.
+```sh
+export CUDA_HOME=/usr/local/cuda
+export PATH="$CUDA_HOME/bin:$PATH"
+```
+
+### 3. Build
+
+Build explicitly for the RTX 5080 architecture:
+
+```sh
+make cuda CUDA_ARCH=sm_120
+```
+
+`make cuda-generic` uses the architecture detected by local `nvcc`. A
+successful CUDA build creates `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`,
+and `ds4-eval`.
+
+### 4. Download or Select a Model
+
+For the routed 2-bit DeepSeek V4 Flash model used by the SSD-streaming path:
+
+```sh
+./download_model.sh ds4f-q2
+```
+
+The downloader stores weights under `gguf/` and updates `ds4flash.gguf` to
+point to the selected model. You can instead provide a supported local GGUF by
+updating that link or passing `-m /path/to/model.gguf` to a binary.
+
+Model files are large. Keep the GGUF on a fast local NVMe SSD and leave enough
+free space for the model, temporary downloads, and optional disk KV cache.
+
+### 5. Start the Local Service
+
+```sh
+./run_ds4_cuda_server.sh
+```
+
+Wait for this line:
+
+```text
+ds4-server: listening on http://127.0.0.1:18099
+```
+
+Then open <http://127.0.0.1:18099>. The **Chat** tab uses the loaded model; the
+**Monitor** tab shows cache, disk, prompt, and expert activity telemetry.
+
+Verify the service from another terminal:
+
+```sh
+curl http://127.0.0.1:18099/health
+curl http://127.0.0.1:18099/v1/models
+```
+
+## Running the Services and Tools
+
+### Browser Chat and Monitor
+
+The browser application is served directly by `ds4-server`; no Node.js build
+or separate web process is required. Its monitor combines these endpoints:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Model, uptime, cumulative expert-cache and disk statistics |
+| `GET /metrics/stream` | One JSON metrics snapshot per second over SSE |
+| `GET /profile` | Completed-prompt timing and I/O history |
+| `GET /experts` | Current expert residency and cumulative access heat map |
+| `GET /admin/status` | Current inference state when web control is enabled |
+| `POST /admin/start` | Resume inference without reloading the process |
+| `POST /admin/stop` | Pause new inference without terminating the process |
+| `POST /admin/restart` | Restart with the same process arguments/environment |
+
+The admin endpoints are enabled only when the server host is exactly
+`127.0.0.1` or `localhost`. They return 404 for network-facing binds.
+
+The cache tile, hit-rate chart, split bar, and Expert Activity counters use the
+same cumulative live snapshot. Counters cover the lifetime of the current
+server process; they are not per-prompt values. Disk bytes are cumulative I/O,
+not space occupied on disk. The expert grid shows residency and recent access
+intensity, and requires expert-map telemetry, which the launch script enables.
+
+If the page was already open while `web/index.html` changed, use a hard browser
+refresh. The server reads the page from disk on each request, so a frontend-only
+change does not require recompiling or restarting the model.
+
+### OpenAI-Compatible API
+
+Use `http://127.0.0.1:18099/v1` as the base URL for OpenAI-compatible clients.
+A minimal request is:
+
+```sh
+curl http://127.0.0.1:18099/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "deepseek-v4-flash",
+    "messages": [{"role": "user", "content": "Explain SSD expert caching."}],
+    "temperature": 0,
+    "max_tokens": 512
+  }'
+```
+
+Supported generation endpoints are:
+
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/completions`
+- `POST /v1/messages`
+
+The server also exposes model aliases for `deepseek-v4-flash` and
+`deepseek-v4-pro`. An alias reports the model currently loaded by the process;
+it does not load a different GGUF. Streaming, reasoning, and tool-call details
+are documented in the extended Server section below.
+
+### Interactive CLI
+
+Run a one-shot prompt:
+
+```sh
+./ds4 --cuda --ssd-streaming -m ds4flash.gguf \
+  --ssd-streaming-cache-experts 7GB \
+  -p "Explain the role of routed experts."
+```
+
+Omit `-p` for a multi-turn terminal session. Use `./ds4 --help` for all
+runtime, sampling, context, and SSD-streaming options.
+
+### Native Coding Agent
+
+`ds4-agent` runs the model and tools in one process and stores resumable KV
+sessions under `~/.ds4/kvcache`:
+
+```sh
+./ds4-agent --cuda --ssd-streaming -m ds4flash.gguf \
+  --ssd-streaming-cache-experts 7GB
+```
+
+Use `--chdir /path/to/ds4_RTX_5080_cuda` when launching it from another
+directory. Agent commands and session behavior are documented in the Native
+agent section below.
+
+### Benchmark and Evaluation
+
+Measure the exact local configuration before changing cache sizes or CUDA
+paths:
+
+```sh
+DS4_CUDA_MMQ=0 \
+DS4_CUDA_NO_Q8_F16_CACHE=1 \
+./ds4-bench --cuda --ssd-streaming -m ds4flash.gguf \
+  --ssd-streaming-cache-experts 7GB \
+  --prefill-chunk 1024 \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 --ctx-max 8192 --step-incr 2048 --gen-tokens 128
+```
+
+Run the real-model capability evaluator with:
+
+```sh
+./ds4-eval --cuda --ssd-streaming -m ds4flash.gguf --plain --questions 4
+```
+
+Benchmarks measure speed; they do not prove output correctness. Use the QA and
+continuation-vector tests described below when changing kernels, quantization,
+cache lifetime, or prefill behavior.
+
+### Eight-GPU Tensor-Parallel Service
+
+`run-nvidia-tp-server.sh` is a separate service manager for the inherited
+eight-GPU CUDA tensor/expert-parallel deployment. It is **not** the RTX 5080
+single-GPU launcher. Its defaults expect devices `0,2,4,6,1,3,5,7`, a model
+under `/home/antirez/models`, KV storage under `/data`, port 8000, and 16
+resident sessions. It also binds to `0.0.0.0` by default, exposing the
+unauthenticated API to the network.
+
+Set safe, valid paths and an intentional bind address before starting it:
+
+```sh
+export DS4_MODEL=/path/to/supported-model.gguf
+export DS4_KV_DIR="$PWD/.cache/tp-kv"
+export DS4_SERVER_HOST=127.0.0.1
+
+./run-nvidia-tp-server.sh start
+./run-nvidia-tp-server.sh status
+./run-nvidia-tp-server.sh restart
+./run-nvidia-tp-server.sh stop
+```
+
+See the multi-GPU section below before using it. Do not run it on the laptop
+profile or alongside another process that owns `/tmp/ds4.lock`.
+
+## RTX 5080 Launch Configuration
+
+`run_ds4_cuda_server.sh` is the reproducible entry point for this fork. Its
+main environment overrides are:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `CUDA_HOME` | `/home/peppe200175/.local/cuda-13.3.1` | CUDA toolkit root; normally override this |
+| `DS4_SERVER_CTX` | `135168` | Allocated context tokens |
+| `DS4_SERVER_EXPERT_CACHE` | `7GB` | Total routed-expert memory budget |
+| `DS4_SERVER_PREFILL_CHUNK` | `1024` | Tokens per prefill graph chunk |
+| `DS4_SERVER_KV_DIR` | `.cache/server-kv` | Disk KV checkpoint directory |
+| `DS4_SERVER_KV_CACHE_MB` | `4096` | Disk KV budget in MiB |
+| `DS4_SERVER_KV_MIN_TOKENS` | `16` | Minimum checkpoint length |
+| `DS4_SERVER_HOST` | `127.0.0.1` | Bind address |
+| `DS4_SERVER_PORT` | `18099` | HTTP port |
+| `DS4_CUDA_WEIGHT_ARENA_CHUNK_MB` | `256` | CUDA weight-arena allocation chunk |
+| `DS4_CUDA_LAZY_KV_CACHE` | `1` | Exported compatibility knob; currently not consumed by the runtime |
+| `DS4_CUDA_LAZY_KV_INITIAL_TOKENS` | `4096` | Exported compatibility knob; currently not consumed by the runtime |
+| `DS4_CUDA_MMQ` | `0` | Keep the unverified MMQ tier disabled |
+
+For example, start with an 8,192-token context and a 10 GiB expert budget:
+
+```sh
+DS4_SERVER_CTX=8192 \
+DS4_SERVER_EXPERT_CACHE=10GB \
+./run_ds4_cuda_server.sh
+```
+
+Additional `ds4-server` options can be appended to the script command:
+
+```sh
+DS4_SERVER_PORT=18100 ./run_ds4_cuda_server.sh --tokens 4096 --trace /tmp/ds4-trace.jsonl
+```
+
+### Understanding the Expert Budget
+
+`--ssd-streaming-cache-experts NGB` is a **total routed memory budget**, not the
+size of the dynamic LRU alone. The CUDA backend first reserves the workspace
+needed for two complete prefill layers and gives the remainder to persistent
+decode experts. Always read the startup accounting, for example:
+
+```text
+cuda SSD streaming total expert budget 10.00 GiB = 3.38 GiB prefill headroom + 6.62 GiB dynamic cache
+```
+
+Increasing this value can improve the hit rate but also increases VRAM use.
+Context and runtime buffers consume additional memory. The startup `memory:`
+line is the authoritative plan for that run; lower the context or expert budget
+if allocation fails.
+
+The script deliberately forces `DS4_CUDA_NO_Q8_F16_CACHE=1` and defaults
+`DS4_CUDA_MMQ=0`. These are correctness choices, not generic tuning advice.
+Change them only while running exact continuation, prompt-adherence, and CUDA
+regression checks.
+
+## Service Lifecycle and Safety
+
+The RTX 5080 script runs in the foreground. Stop it with Ctrl+C in its terminal.
+DwarfStar uses `/tmp/ds4.lock` to prevent two very large model processes from
+running concurrently. Do not delete an active lock or start a second copy to
+work around it; stop the owning process first.
+
+The server has no built-in user authentication. The default
+`DS4_SERVER_HOST=127.0.0.1` is intentionally local-only. Binding to `0.0.0.0`
+exposes the API, browser UI, model output, and monitoring data to the network;
+the admin routes are disabled for that bind. Put an authenticated reverse proxy
+and firewall in front of it before allowing access from untrusted machines.
+`--cors` changes browser headers only; it is not an access-control mechanism.
+
+Disk KV checkpoints can contain prompt and conversation state. Protect or
+delete `.cache/server-kv` according to the sensitivity of the material sent to
+the model. Traces can contain even more complete request and tool-call data.
+
+## Troubleshooting
+
+### `nvcc` is missing or the architecture is unsupported
+
+Set `CUDA_HOME` to a toolkit that supports `sm_120`, put its `bin` directory on
+`PATH`, and rebuild with `make cuda CUDA_ARCH=sm_120`.
+
+### The model cannot be opened
+
+Check that `ds4flash.gguf` resolves to an existing supported GGUF:
+
+```sh
+ls -l ds4flash.gguf
+```
+
+Run `./download_model.sh ds4f-q2` again to resume an interrupted download and
+refresh the link.
+
+### `/tmp/ds4.lock` is already owned
+
+Another DS4 process may still be running. Stop that process cleanly before
+starting this service. A stale lock can be removed only after verifying its PID
+is no longer alive.
+
+### CUDA reports out of memory
+
+Reduce `DS4_SERVER_EXPERT_CACHE`, `DS4_SERVER_CTX`, or both. Remember that the
+expert budget is only one part of planned memory. Inspect the startup `memory:`
+line for KV, buffers, resident model, dynamic expert cache, and prefill reserve.
+
+### The UI opens but metrics do not move
+
+Confirm `metrics: live` appears in the header and that `/health` and
+`/metrics/stream` respond. Hard-refresh after frontend changes. Expert counters
+advance during inference; the profile table updates after a prompt completes.
+
+### The server is listening on a different port
+
+The generic binary defaults to port 8000, while this fork's RTX 5080 script
+defaults to 18099. Use the URL printed by `ds4-server: listening on ...`, not an
+assumed port.
+
+## Validation Before Changing the CUDA Path
+
+At minimum, build and inspect the available checks:
+
+```sh
+make cuda CUDA_ARCH=sm_120
+make help
+```
+
+Relevant focused targets include:
+
+```sh
+make test-cuda-flash-moe-decode
+make test-cuda-q8-batch-decode-exact
+make cuda-regression
+```
+
+Some tests require a large local model, CUDA hardware, generated fixtures, or
+significant runtime. Read [CONTRIBUTING.md](CONTRIBUTING.md) and
+[QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md) before treating a change as
+release-ready. Do not replace exactness checks with a speed-only benchmark.
+
+## Updating From the Main DS4 Project
+
+This checkout normally uses `origin` for the fork and `upstream` for the main
+project. Review upstream changes before merging because CUDA kernels, model
+layouts, cache contracts, and the web/server surface can move together:
+
+```sh
+git fetch upstream
+git log --oneline main..upstream/main
+git merge upstream/main
+```
+
+After resolving any conflicts, rebuild and repeat the focused CUDA, server,
+continuation, and prompt-adherence checks. Keep fork-specific commits focused so
+future upstream merges remain reviewable.
+
+## Thanks and Acknowledgements
+
+This fork exists because of the work shared by the **main DwarfStar project**.
+A sincere thank you to **Salvatore Sanfilippo (antirez)** for creating and
+opening DS4, and to every DS4 contributor, tester, reviewer, hardware provider,
+and user who reported results. The model-specific engine, quantization work,
+server protocols, distributed paths, test vectors, and documentation inherited
+here are the product of that collaboration. Fork-specific changes are intended
+to contribute another tested hardware path back to that wider effort.
+
+DwarfStar itself stands on the work of
+[`llama.cpp`](https://github.com/ggml-org/llama.cpp), GGML, Georgi Gerganov, and
+their many contributors. Their kernels, quantization formats, GGUF ecosystem,
+tests, and engineering knowledge made this project possible. Source-level
+pieces retained or adapted under the MIT license remain acknowledged in
+[LICENSE](LICENSE).
+
+The project also discloses substantial AI assistance in development, with
+humans directing design, testing, debugging, and release decisions. That does
+not reduce the importance of the human and open-source work on which this fork
+depends.
+
+## Documentation Map
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
-  guide for contributors. **Read this before sending a pull request**.
-- [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): the complete release test
-  matrix, including the remote Metal, CUDA, and ROCm machines.
-- [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
-  imatrix collection, quantization tooling, and quality checks.
-- [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
-  routed-MoE imatrix is collected and used.
+  guide for contributors.
+- [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): release test matrix for Metal,
+  CUDA, and ROCm systems.
+- [MODEL_CARD.md](MODEL_CARD.md): model purpose, limits, and usage context.
+- [STRIXHALO.md](STRIXHALO.md): ROCm/Strix Halo notes.
+- [gguf-tools/README.md](gguf-tools/README.md): GGUF generation, imatrix,
+  quantization, and quality tooling.
+- [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): routed-MoE
+  imatrix collection and use.
 - [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
-  how the calibration prompt corpus is generated.
+  calibration prompt corpus generation.
 - [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
-  how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
-- [dir-steering/README.md](dir-steering/README.md): directional steering data,
-  vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
-  and CSV generation.
+  local scoring against official continuations.
+- [dir-steering/README.md](dir-steering/README.md): directional steering data
+  and runtime usage.
+- [speed-bench/README.md](speed-bench/README.md): benchmark commands and result
+  generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
+
+# Extended DwarfStar Reference
+
+The remaining sections preserve and extend the main project's detailed model,
+backend, distributed, API, agent, KV-cache, and testing documentation. Fork
+users should treat this as the authoritative reference beyond the RTX 5080
+quick-start profile above.
 
 ## Model Weights
 
@@ -198,24 +593,21 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 DSpark is an auxiliary draft model released by DeepSeek for DeepSeek V4 Flash.
 It reads hidden states from the main model and proposes up to five future
 tokens. DwarfStar checks those proposals with the main Flash model and commits
-only the accepted prefix. The main model remains authoritative; a rejected or
-low-confidence suffix falls back to ordinary target decoding.
+only the accepted prefix. Production currently verifies at most two proposed
+tokens per cycle. Before each commit it compares the proposal with the exact
+argmax from the ordinary one-token target path, so the main model remains
+authoritative and a rejected suffix leaves the sequential target state intact.
 
-The possible gain is faster generation: when several proposed tokens are
-accepted, one target verification pass advances the stream by several tokens.
-It does not accelerate prefill, and the draft and verification work is not
-free. Predictable continuations, especially code, tend to benefit most;
-low-yield prompts can be no faster or even slower. DSpark is therefore still
-experimental and explicitly opt-in.
+The current correctness-first verifier does not batch target execution, so it
+is not expected to make generation faster: accepted drafts still run through
+the ordinary one-token target decode and the support-model proposal is extra
+work. It does not accelerate prefill. DSpark remains experimental and
+explicitly opt-in while an exact, faster verifier is developed.
 
-Accepted proposals keep the state produced by the batched target verifier
-instead of running the same tokens through one-token decode again. Both paths
-execute the same inference graph, but floating-point operations are grouped in
-a different order. A long greedy DSpark run may therefore diverge from a run
-without DSpark after an otherwise valid accepted block. This is not a reduced
-precision or approximate-model mode; use ordinary decoding, `--quality`, or
-`--dspark-strict` when byte-for-byte reproducibility with one-token decode is
-required.
+At temperature zero, DSpark must emit the same token stream as ordinary target
+decode. The acceptance fixture and DSpark depth regression treat any token
+difference as a correctness failure. `--quality` and `--dspark-strict` still
+disable proposal acceptance entirely and remain useful target-only controls.
 
 The DSpark checkpoint for Flash 0731 is packaged here as a separate support
 GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
@@ -243,10 +635,10 @@ Run it with greedy decoding:
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
 The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm;
 it prunes suffixes that are unlikely to repay their verification cost.
-`--dspark-confidence 0` forces fixed five-token blocks and is intended for
-diagnostics. Sampled decoding does not use DSpark proposals. `--quality` and
-`--dspark-strict` also keep target-only decoding, which is useful for
-reproducibility checks.
+`--dspark-confidence 0` asks the drafter for a fixed five-token proposal, but
+the production target verifier still checks at most two of those tokens per
+cycle. This setting is intended for diagnostics. Sampled decoding does not use
+DSpark proposals. `--quality` and `--dspark-strict` keep target-only decoding.
 
 ## Speed
 

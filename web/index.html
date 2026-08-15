@@ -69,6 +69,18 @@ header .logo span { color: var(--blue); }
 #streamState { margin-left: auto; color: var(--dim); font-size: 12px; }
 #streamState.live { color: var(--green); }
 #streamState.down { color: var(--orange); }
+.serverControls { display: flex; align-items: center; gap: 7px; }
+#serverState { color: var(--green); font-size: 11px; min-width: 58px; text-align: right; }
+#serverState.stopped { color: var(--orange); }
+.controlBtn {
+  border: 1px solid var(--border); border-radius: 5px; padding: 5px 10px;
+  background: var(--panel2); color: var(--fg); font: inherit; font-size: 12px; cursor: pointer;
+}
+.controlBtn:hover:not(:disabled) { border-color: var(--blue); }
+.controlBtn.start { color: var(--green); }
+.controlBtn.stop { color: var(--orange); }
+.controlBtn.restart { background: #7d2a26; border-color: #7d2a26; color: #fff; }
+.controlBtn:disabled { opacity: .4; cursor: default; }
 /* ---------- views ---------- */
 main { flex: 1 1 auto; min-height: 0; display: flex; }
 .view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; width: 100%; }
@@ -177,6 +189,23 @@ main { flex: 1 1 auto; min-height: 0; display: flex; }
   outline: none;
 }
 #composer:focus { border-color: var(--blue); }
+.thinkingControl {
+  height: 38px; display: flex; align-items: center; gap: 7px; padding: 0 9px;
+  color: var(--orange); background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 6px; white-space: nowrap; user-select: none;
+}
+.thinkingControl input { accent-color: var(--orange); }
+.thinkingControl select {
+  color: var(--fg); background: var(--panel); border: 1px solid var(--border);
+  border-radius: 4px; font: inherit; padding: 3px 5px;
+}
+.thinkingControl select:disabled { opacity: .45; }
+.thinkingPanel {
+  margin-bottom: 9px; border: 1px solid #6e4b16; border-radius: 5px;
+  background: rgba(217, 131, 43, .07); color: var(--dim);
+}
+.thinkingPanel summary { cursor: pointer; padding: 6px 9px; color: var(--orange); font-weight: 600; }
+.thinkingText { max-height: 280px; overflow: auto; padding: 0 9px 9px; white-space: pre-wrap; }
 .btn {
   background: var(--panel2);
   color: var(--fg);
@@ -291,6 +320,12 @@ tr.row-new td { animation: rowFlash 2s ease-out; }
     <button id="tabMonitor" data-view="monitor">Monitor</button>
   </nav>
   <span id="streamState">metrics: connecting…</span>
+  <div class="serverControls">
+    <span id="serverState">checking…</span>
+    <button id="serverStartBtn" class="controlBtn start" disabled>Start</button>
+    <button id="serverStopBtn" class="controlBtn stop" disabled>Stop</button>
+    <button id="serverRestartBtn" class="controlBtn restart">Restart</button>
+  </div>
 </header>
 <main>
   <!-- ================= CHAT ================= -->
@@ -304,6 +339,14 @@ tr.row-new td { animation: rowFlash 2s ease-out; }
     </div>
     <div id="composerBar">
       <textarea id="composer" rows="1" placeholder="Message ds4… (Enter to send, Shift+Enter for newline)"></textarea>
+      <label class="thinkingControl" title="Enable hidden reasoning before the final answer">
+        <input id="thinkingEnabled" type="checkbox">
+        <span>Thinking</span>
+        <select id="thinkingLevel" aria-label="Thinking level" disabled>
+          <option value="high">High</option>
+          <option value="max">Max</option>
+        </select>
+      </label>
       <button id="clearBtn" class="btn">Clear</button>
       <button id="sendBtn" class="btn primary">Send</button>
     </div>
@@ -488,8 +531,24 @@ const sendBtn = $('sendBtn');
 const clearBtn = $('clearBtn');
 const liveBadge = $('liveBadge');
 const lbTokens = $('lbTokens'), lbElapsed = $('lbElapsed'), lbTokS = $('lbTokS'), lbFinal = $('lbFinal');
+const serverStartBtn = $('serverStartBtn'), serverStopBtn = $('serverStopBtn');
+const serverRestartBtn = $('serverRestartBtn'), serverState = $('serverState');
+const thinkingEnabled = $('thinkingEnabled'), thinkingLevel = $('thinkingLevel');
 
 const chat = { msgs: [], ctrl: null, sending: false };
+let inferenceRunning = true;
+let controlBusy = false;
+
+thinkingEnabled.checked = localStorage.getItem('ds4-thinking-enabled') === 'true';
+thinkingLevel.value = localStorage.getItem('ds4-thinking-level') === 'max' ? 'max' : 'high';
+thinkingLevel.disabled = !thinkingEnabled.checked;
+thinkingEnabled.addEventListener('change', () => {
+  thinkingLevel.disabled = !thinkingEnabled.checked;
+  localStorage.setItem('ds4-thinking-enabled', String(thinkingEnabled.checked));
+});
+thinkingLevel.addEventListener('change', () => {
+  localStorage.setItem('ds4-thinking-level', thinkingLevel.value);
+});
 
 function scrollBottom() {
   const nearBottom = msgList.scrollHeight - msgList.scrollTop - msgList.clientHeight < 160;
@@ -510,6 +569,14 @@ function addAssistantShell() {
   const wrap = el('div', 'msg assistant');
   wrap.appendChild(el('div', 'role', 'ds4'));
   const bubble = el('div', 'bubble');
+  const reasoningPanel = el('details', 'thinkingPanel');
+  reasoningPanel.style.display = 'none';
+  reasoningPanel.appendChild(el('summary', null, 'Thinking'));
+  const reasoningText = el('div', 'thinkingText');
+  reasoningPanel.appendChild(reasoningText);
+  bubble.appendChild(reasoningPanel);
+  const contentEl = el('div', 'answerContent');
+  bubble.appendChild(contentEl);
   const typing = el('span', 'typing');
   typing.appendChild(el('i')); typing.appendChild(el('i')); typing.appendChild(el('i'));
   bubble.appendChild(typing);
@@ -519,7 +586,7 @@ function addAssistantShell() {
   wrap.appendChild(statsRow);
   msgList.appendChild(wrap);
   msgList.scrollTop = msgList.scrollHeight;
-  return { bubble, typing, statsRow };
+  return { bubble, contentEl, reasoningPanel, reasoningText, typing, statsRow };
 }
 
 function badge(label, value) {
@@ -548,8 +615,72 @@ function setSending(on) {
   sendBtn.textContent = on ? 'Stop' : 'Send';
   sendBtn.classList.toggle('danger', on);
   sendBtn.classList.toggle('primary', !on);
-  composer.disabled = false;
+  composer.disabled = !inferenceRunning;
+  if (!on) sendBtn.disabled = !inferenceRunning;
 }
+
+function renderServerState(state) {
+  inferenceRunning = state === 'running';
+  serverState.textContent = state;
+  serverState.classList.toggle('stopped', !inferenceRunning);
+  serverStartBtn.disabled = controlBusy || inferenceRunning;
+  serverStopBtn.disabled = controlBusy || !inferenceRunning;
+  serverRestartBtn.disabled = controlBusy;
+  composer.disabled = !inferenceRunning;
+  sendBtn.disabled = !inferenceRunning && !chat.sending;
+  composer.placeholder = inferenceRunning
+    ? 'Message ds4… (Enter to send, Shift+Enter for newline)'
+    : 'Inference stopped — press Start';
+}
+
+async function refreshServerState() {
+  try {
+    const r = await fetch('/admin/status', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    renderServerState(j.state || 'running');
+    return true;
+  } catch (e) {
+    serverState.textContent = 'offline';
+    serverState.classList.add('stopped');
+    return false;
+  }
+}
+
+async function serverControl(action) {
+  controlBusy = true;
+  serverState.textContent = action === 'restart' ? 'restarting…' : action + 'ing…';
+  serverStartBtn.disabled = serverStopBtn.disabled = serverRestartBtn.disabled = true;
+  try {
+    const r = await fetch('/admin/' + action, { method: 'POST' });
+    if (!r.ok && r.status !== 202) throw new Error(await r.text() || ('HTTP ' + r.status));
+    if (action !== 'restart') {
+      const j = await r.json();
+      controlBusy = false;
+      renderServerState(j.state);
+      return;
+    }
+    for (let i = 0; i < 90; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (await refreshServerState()) break;
+    }
+  } catch (e) {
+    alert('Server ' + action + ' failed: ' + (e && e.message ? e.message : String(e)));
+  } finally {
+    controlBusy = false;
+    await refreshServerState();
+  }
+}
+
+serverStartBtn.addEventListener('click', () => serverControl('start'));
+serverStopBtn.addEventListener('click', () => serverControl('stop'));
+serverRestartBtn.addEventListener('click', () => {
+  if (confirm('Restart ds4-server with the same cache and context configuration?')) {
+    serverControl('restart');
+  }
+});
+refreshServerState();
+setInterval(refreshServerState, 5000);
 
 function liveReset() {
   lbTokens.textContent = '0';
@@ -566,7 +697,7 @@ function liveDone(ttftS, tokS) {
 
 async function sendChat() {
   const text = composer.value.trim();
-  if (!text || chat.sending) return;
+  if (!text || chat.sending || !inferenceRunning) return;
   composer.value = '';
   composer.style.height = 'auto';
   chat.msgs.push({ role: 'user', content: text });
@@ -576,11 +707,16 @@ async function sendChat() {
   liveReset();
   chat.ctrl = new AbortController();
   const shell = addAssistantShell();
-  const acc = { content: '' };
+  const acc = { content: '', reasoning: '' };
   const t0 = performance.now();
-  let tFirst = 0, chunks = 0, ds4Stats = null, usage = null, sawDone = false;
+  let tFirst = 0, generatedTokens = 0, ds4Stats = null, usage = null, sawDone = false;
 
-  const renderNow = () => { mdRender(shell.bubble, acc.content); scrollBottom(); };
+  const renderNow = () => { mdRender(shell.contentEl, acc.content); scrollBottom(); };
+  const renderReasoning = () => {
+    shell.reasoningPanel.style.display = '';
+    shell.reasoningText.textContent = acc.reasoning;
+    scrollBottom();
+  };
 
   try {
     const res = await fetch(location.origin + '/v1/chat/completions', {
@@ -588,7 +724,13 @@ async function sendChat() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'ds4',
-        messages: chat.msgs.map(m => ({ role: m.role, content: m.content })),
+        messages: chat.msgs.map(m => {
+          const out = { role: m.role, content: m.content };
+          if (m.reasoning_content) out.reasoning_content = m.reasoning_content;
+          return out;
+        }),
+        thinking: thinkingEnabled.checked,
+        reasoning_effort: thinkingEnabled.checked ? thinkingLevel.value : 'none',
         stream: true,
         stream_options: { include_usage: true }
       }),
@@ -617,15 +759,28 @@ async function sendChat() {
           if (j && typeof j === 'object' && j.ds4) { ds4Stats = j.ds4; continue; }
           if (j && j.usage) usage = j.usage;
           const delta = j && j.choices && j.choices[0] && j.choices[0].delta;
+          let generatedDelta = false;
+          if (delta && typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+            if (!tFirst) { tFirst = performance.now(); shell.typing.remove(); }
+            acc.reasoning += delta.reasoning_content;
+            generatedDelta = true;
+            renderReasoning();
+          }
           if (delta && typeof delta.content === 'string' && delta.content) {
             if (!tFirst) { tFirst = performance.now(); shell.typing.remove(); }
-            chunks++;
             acc.content += delta.content;
+            generatedDelta = true;
             renderNow();
+          }
+          /* The server emits one streamed delta per sampled token. A boundary
+           * token may carry both reasoning and answer fields, so count the SSE
+           * choice once rather than counting its fields independently. */
+          if (generatedDelta) {
+            generatedTokens++;
             const elS = (performance.now() - t0) / 1000;
-            lbTokens.textContent = String(chunks);
+            lbTokens.textContent = String(generatedTokens);
             lbElapsed.textContent = elS.toFixed(1) + 's';
-            lbTokS.textContent = (chunks / Math.max(elS, 0.001)).toFixed(1) + ' tok/s';
+            lbTokS.textContent = (generatedTokens / Math.max(elS, 0.001)).toFixed(1) + ' tok/s';
           }
         }
       }
@@ -636,31 +791,45 @@ async function sendChat() {
       renderNow();
     } else {
       shell.typing.remove();
-      shell.bubble.textContent = '';
-      shell.bubble.appendChild(el('p', null, '⚠ request failed: ' + (err && err.message ? err.message : String(err))));
+      shell.contentEl.textContent = '';
+      shell.contentEl.appendChild(el('p', null, '⚠ request failed: ' + (err && err.message ? err.message : String(err))));
     }
   }
 
-  if (!acc.content && !shell.bubble.textContent) {
+  if (!acc.content && !acc.reasoning && !shell.contentEl.textContent) {
     shell.typing.remove();
-    shell.bubble.textContent = '(empty response)';
+    shell.contentEl.textContent = '(empty response)';
+  } else if (!acc.content && acc.reasoning) {
+    shell.typing.remove();
+    shell.contentEl.textContent = '(no final answer returned)';
   } else if (acc.content && shell.typing.parentNode) {
     shell.typing.remove();
     renderNow();
   }
 
-  const totalS = (performance.now() - t0) / 1000;
+  const finishedAt = performance.now();
+  const totalS = (finishedAt - t0) / 1000;
+  /* OpenAI-compatible completion_tokens includes both visible answer tokens
+   * and hidden reasoning tokens.  Prefer it once the terminal usage chunk
+   * arrives, while retaining the per-delta counter for live feedback. */
+  const outputTokens = usage && Number.isFinite(usage.completion_tokens)
+    ? usage.completion_tokens
+    : (ds4Stats && Number.isFinite(ds4Stats.completion_tokens)
+      ? ds4Stats.completion_tokens : generatedTokens);
+  const generationS = tFirst ? Math.max((finishedAt - tFirst) / 1000, 0.001) : 0;
+  if (outputTokens > 0) lbTokens.textContent = String(outputTokens);
+  lbElapsed.textContent = totalS.toFixed(1) + 's';
   const ttftS = ds4Stats && typeof ds4Stats.ttft_s === 'number' ? ds4Stats.ttft_s
     : (tFirst ? (tFirst - t0) / 1000 : null);
-  const finalTokS = ds4Stats && typeof ds4Stats.tok_s === 'number' ? ds4Stats.tok_s
-    : (chunks ? chunks / Math.max(totalS, 0.001) : null);
+  const finalTokS = outputTokens && generationS ? outputTokens / generationS
+    : (ds4Stats && typeof ds4Stats.tok_s === 'number' ? ds4Stats.tok_s : null);
   liveDone(ttftS, finalTokS);
   showStatsRow(shell.statsRow, ds4Stats || (usage ? {
     prompt_tokens: usage.prompt_tokens,
     completion_tokens: usage.completion_tokens
   } : null));
 
-  chat.msgs.push({ role: 'assistant', content: acc.content });
+  chat.msgs.push({ role: 'assistant', content: acc.content, reasoning_content: acc.reasoning });
   setSending(false);
   void sawDone;
 }
@@ -768,6 +937,7 @@ const streamState = $('streamState');
 const BACKOFF = [1000, 2000, 5000, 10000];
 let backoffIdx = 0;
 let metricsES = null;
+let metricsLive = false;
 
 function setStreamState(mode, retryS) {
   streamState.classList.remove('live', 'down');
@@ -787,21 +957,27 @@ function connectMetrics() {
     scheduleReconnect();
     return;
   }
-  metricsES.onopen = () => { backoffIdx = 0; setStreamState('live'); };
+  metricsES.onopen = () => {
+    backoffIdx = 0;
+    metricsLive = true;
+    setStreamState('live');
+  };
   metricsES.onmessage = (ev) => {
     let j;
     try { j = JSON.parse(ev.data); } catch (e) { return; }
     if (!j || typeof j !== 'object') return;
     charts[0].push(j.disk_mbs || 0);
     charts[1].push(j.disk_avg_ms || 0);
-    charts[2].push((j.cache_hit_rate || 0) * (j.cache_hit_rate <= 1 ? 100 : 1));
+    charts[2].push(renderExpertMetrics(j.expert_hits, j.expert_misses));
   };
   metricsES.onerror = () => {
+    metricsLive = false;
     try { metricsES.close(); } catch (e) { /* ignore */ }
     scheduleReconnect();
   };
 }
 function scheduleReconnect() {
+  metricsLive = false;
   const wait = BACKOFF[Math.min(backoffIdx, BACKOFF.length - 1)];
   backoffIdx++;
   setStreamState('down', Math.round(wait / 1000));
@@ -825,11 +1001,7 @@ async function pollHealth() {
   $('tStatus').textContent = 'status: ' + (j.status || '—');
   $('tUptime').textContent = fmtUptime(j.uptime_s);
   const ec = j.expert_cache || {};
-  const hr = typeof ec.hit_rate === 'number' ? ec.hit_rate : 0;
-  const pct = hr <= 1 ? hr * 100 : hr;
-  $('tHitRate').textContent = pct.toFixed(1) + '%';
-  $('tCacheHM').textContent = 'hits ' + fmtInt(ec.hits || 0) + ' / misses ' + fmtInt(ec.misses || 0);
-  $('tGauge').style.width = Math.min(100, Math.max(0, pct)) + '%';
+  if (!metricsLive) renderExpertMetrics(ec.hits, ec.misses);
   const dk = j.disk || {};
   $('tDiskGB').textContent = fmtNum((dk.bytes_read || 0) / (1 << 30)) + ' GB';
   $('tDiskReads').textContent = fmtInt(dk.reads || 0) + ' reads';
@@ -857,6 +1029,20 @@ function updateSplit(hits, misses) {
   $('splitPct').textContent = tot > 0
     ? pctH.toFixed(0) + '% VRAM / ' + (100 - pctH).toFixed(0) + '% disk'
     : 'no data';
+}
+
+function renderExpertMetrics(hits, misses) {
+  hits = typeof hits === 'number' && isFinite(hits) ? Math.max(0, hits) : 0;
+  misses = typeof misses === 'number' && isFinite(misses) ? Math.max(0, misses) : 0;
+  const total = hits + misses;
+  const pct = total > 0 ? (hits / total) * 100 : 0;
+  $('tHitRate').textContent = pct.toFixed(1) + '%';
+  $('tCacheHM').textContent = 'hits ' + fmtInt(hits) + ' / misses ' + fmtInt(misses);
+  $('tGauge').style.width = Math.min(100, pct) + '%';
+  counters.hits.target = hits;
+  counters.miss.target = misses;
+  updateSplit(hits, misses);
+  return pct;
 }
 
 async function pollProfile() {
@@ -892,26 +1078,12 @@ async function pollProfile() {
     profileBody.appendChild(tr);
   }
 
-  /* expert counters: delta of new prompts between polls */
-  let maxId = null, dH = 0, dM = 0, newest = null;
+  let maxId = null;
   for (const p of prompts) {
     if (typeof p.id !== 'number') continue;
-    if (maxId === null || p.id > maxId) { maxId = p.id; newest = p; }
-    if (prevMaxId !== null && p.id > prevMaxId) {
-      dH += p.expert_hits || 0;
-      dM += p.expert_misses || 0;
-    }
+    if (maxId === null || p.id > maxId) maxId = p.id;
   }
-  if (maxId !== null) {
-    if (prevMaxId !== null) {
-      counters.hits.target += dH;
-      counters.miss.target += dM;
-    }
-    if (newest && (prevMaxId === null || maxId > prevMaxId)) {
-      updateSplit(newest.expert_hits || 0, newest.expert_misses || 0);
-    }
-    prevMaxId = maxId;
-  }
+  if (maxId !== null) prevMaxId = maxId;
 }
 setInterval(() => { pollProfile().catch(() => {}); }, 2000);
 pollProfile().catch(() => {});
@@ -933,6 +1105,7 @@ const expertNote = $('expertGridNote');
 let expertsAvail = false;
 let expertData = null;
 const heatMap = new Map();   /* flat idx -> smoothed heat */
+const accessMap = new Map(); /* flat idx -> previous cumulative accesses */
 const flashMap = new Map();  /* flat idx -> 0..1 flash intensity */
 let heatMax = 1;
 let residentSet = new Set();
@@ -956,10 +1129,13 @@ async function pollExperts() {
     for (const rec of (Array.isArray(j.heat) ? j.heat : [])) {
       if (!Array.isArray(rec) || rec.length < 3) continue;
       const flat = rec[0] * M + rec[1];
-      const v = (heatMap.get(flat) || 0) * 0.7 + rec[2];
+      const previous = accessMap.get(flat) || 0;
+      const delta = Math.max(0, rec[2] - previous);
+      accessMap.set(flat, rec[2]);
+      const v = (heatMap.get(flat) || 0) * 0.7 + delta;
       heatMap.set(flat, v);
       if (v > heatMax) heatMax = v;
-      flashMap.set(flat, 1);
+      if (delta > 0) flashMap.set(flat, 1);
     }
     if (!expertsAvail) setExpertsAvail(true);
     drawExperts();

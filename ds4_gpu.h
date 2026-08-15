@@ -193,6 +193,65 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+typedef enum ds4_gpu_stream_expert_cache_phase {
+    DS4_GPU_STREAM_EXPERT_CACHE_PHASE_NONE = 0,
+    DS4_GPU_STREAM_EXPERT_CACHE_PHASE_PREFILL = 1,
+    DS4_GPU_STREAM_EXPERT_CACHE_PHASE_DECODE = 2,
+} ds4_gpu_stream_expert_cache_phase;
+typedef struct ds4_gpu_stream_expert_cache_stats {
+    uint32_t capacity;
+    uint32_t resident;
+    uint32_t current_phase;
+    uint32_t _reserved;
+    uint64_t request_epoch;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t admissions;
+    uint64_t evictions;
+    uint64_t prefill_hits;
+    uint64_t prefill_misses;
+    uint64_t prefill_admissions;
+    uint64_t prefill_evictions;
+    uint64_t decode_hits;
+    uint64_t decode_misses;
+    uint64_t decode_admissions;
+    uint64_t decode_evictions;
+    uint64_t prefetch_requested;
+    uint64_t prefetch_unique;
+    uint64_t prefetch_already_resident;
+    uint64_t prefetch_admitted;
+    uint64_t prefetch_skipped_full;
+    uint64_t prefetch_useful;
+    uint64_t prefetch_wasted;
+    uint64_t prefetch_bytes;
+    uint32_t layer_quota_configured;
+    uint32_t layer_quota_active;
+    uint32_t layer_quota_known_layers;
+    uint32_t layer_quota_target;
+    uint32_t layer_quota_decode_configured;
+    uint32_t layer_quota_prefill_armed;
+    uint64_t layer_quota_victims;
+    uint64_t layer_quota_decode_victims;
+    uint64_t layer_quota_same_layer_replacements;
+} ds4_gpu_stream_expert_cache_stats;
+/* Marks the phase that owns subsequent serialized expert-cache operations.
+ * Request epochs are advanced by reset_route_hotness(), which is the existing
+ * request-local policy boundary, rather than by scheduler phase switches. */
+void ds4_gpu_stream_expert_cache_set_phase(
+        ds4_gpu_stream_expert_cache_phase phase);
+void ds4_gpu_stream_expert_cache_get_stats(
+        ds4_gpu_stream_expert_cache_stats *stats);
+typedef struct ds4_gpu_expert_map_entry {
+    uint32_t layer;
+    uint32_t expert;
+    uint64_t accesses;
+    int resident;
+} ds4_gpu_expert_map_entry;
+uint32_t ds4_gpu_stream_expert_cache_map_snapshot(
+        ds4_gpu_expert_map_entry *entries,
+        uint32_t capacity,
+        uint32_t *layers,
+        uint32_t *experts_per_layer);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
@@ -203,11 +262,17 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    down_offset;
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
+    uint32_t    gate_type;
+    uint32_t    down_type;
+    uint32_t    expert_in_dim;
+    uint32_t    expert_mid_dim;
+    uint32_t    out_dim;
 } ds4_gpu_stream_expert_table;
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
 void ds4_gpu_stream_expert_cache_release_resident(void);
+void ds4_gpu_stream_expert_cache_release_staging(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes);
@@ -2552,6 +2617,41 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                layer_index,
         bool                    force_resident);
 
+/* Diagnostic SSD decode entry. stream_slot_offset is measured in selected-ID
+ * slots (not bytes) within the compact batch prepared by
+ * ds4_gpu_stream_expert_cache_prepare_selected_batch(). A non-zero offset is
+ * accepted only for the top-6, n_tokens=1 streaming path. */
+int ds4_gpu_routed_moe_one_tensor_stream_slot_offset(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint64_t                stream_slot_offset,
+        const ds4_gpu_tensor *add_in,
+        uint32_t                layer_index,
+        bool                    force_resident);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -2861,6 +2961,15 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+typedef struct ds4_gpu_decode_graph_stats {
+    uint64_t captures;
+    uint64_t replays;
+    uint64_t failed;
+    uint64_t moe_captures;
+    uint64_t moe_replays;
+    uint64_t moe_failed;
+} ds4_gpu_decode_graph_stats;
+void ds4_gpu_decode_graphs_get_stats(ds4_gpu_decode_graph_stats *stats);
 
 #ifdef __cplusplus
 }

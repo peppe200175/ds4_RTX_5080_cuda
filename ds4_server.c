@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
+#include "ds4_gpu.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_metrics.h"
@@ -42,6 +43,7 @@
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
+static volatile sig_atomic_t g_restart_requested = 0;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
@@ -59,6 +61,17 @@ static void stop_signal_handler(int sig) {
     if (g_listen_fd >= 0) {
         int fd = (int)g_listen_fd;
         g_listen_fd = -1;
+        close(fd);
+    }
+}
+
+static void request_process_restart(void) {
+    g_restart_requested = 1;
+    g_stop_requested = 1;
+    if (g_listen_fd >= 0) {
+        int fd = (int)g_listen_fd;
+        g_listen_fd = -1;
+        shutdown(fd, SHUT_RDWR);
         close(fd);
     }
 }
@@ -5402,10 +5415,12 @@ static void append_cors_headers(buf *h) {
 
 static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
     const char *reason = code == 200 ? "OK" :
+                         code == 202 ? "Accepted" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
+                         code == 503 ? "Service Unavailable" :
                          code == 500 ? "Internal Server Error" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
@@ -8456,6 +8471,8 @@ struct server {
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    bool allow_web_control;
+    bool inference_enabled;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -10510,6 +10527,7 @@ static int server_session_sync(server *s, server_slot *slot,
     if (!s || !slot || !prompt) return 1;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        ds4_engine_streaming_cache_prefill_phase(s->engine);
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
         server_prefill_leave(s);
         return rc;
@@ -10532,12 +10550,15 @@ static int server_session_sync(server *s, server_slot *slot,
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        ds4_engine_streaming_cache_prefill_phase(s->engine);
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s);
         called = true;
         if (rc != 0) return rc;
-        if (done >= prompt->len) return 0;
+        if (done >= prompt->len) {
+            return 0;
+        }
         if (done < target) {
             if (err && errlen) snprintf(err, errlen, "prefill made no progress");
             return 1;
@@ -11044,6 +11065,7 @@ static int server_eval_token(server *s, server_slot *slot, int token,
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
         pthread_mutex_lock(&s->inference_mu);
+        ds4_engine_streaming_cache_decode_phase(s->engine);
         int rc = ds4_session_eval(slot->session, token, err, errlen);
         pthread_mutex_unlock(&s->inference_mu);
         return rc;
@@ -11167,6 +11189,7 @@ static void *decode_worker_main(void *arg) {
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
+        ds4_engine_streaming_cache_decode_phase(s->engine);
         int rc = ds4_sessions_eval_batch(items, count,
                                          batch_err, sizeof(batch_err));
         pthread_mutex_unlock(&s->inference_mu);
@@ -12779,6 +12802,29 @@ static int server_active_requests(server *s) {
     return active;
 }
 
+static bool server_inference_enabled(server *s) {
+    pthread_mutex_lock(&s->mu);
+    bool enabled = s->inference_enabled;
+    pthread_mutex_unlock(&s->mu);
+    return enabled;
+}
+
+static void server_set_inference_enabled(server *s, bool enabled) {
+    pthread_mutex_lock(&s->mu);
+    s->inference_enabled = enabled;
+    pthread_mutex_unlock(&s->mu);
+}
+
+static void send_admin_status(server *s, int fd) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"state\":\"%s\",\"active_requests\":%d,\"restart_supported\":true}\n",
+        server_inference_enabled(s) ? "running" : "stopped",
+        server_active_requests(s));
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
 static void append_prompt_stat_json(buf *b, const ds4_prompt_stat *p) {
     buf_printf(b,
         "{\"id\":%llu,\"ts\":%.3f,\"prompt_tokens\":%d,\"completion_tokens\":%d,"
@@ -12805,6 +12851,18 @@ static void append_prompt_stat_json(buf *b, const ds4_prompt_stat *p) {
 static void send_health(server *s, int fd) {
     ds4_metrics_snapshot m;
     ds4_metrics_get_snapshot(&m);
+    ds4_gpu_stream_expert_cache_stats cache = {0};
+    ds4_gpu_decode_graph_stats decode_graphs = {0};
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_gpu_stream_expert_cache_get_stats(&cache);
+    ds4_gpu_decode_graphs_get_stats(&decode_graphs);
+#endif
+    const char *cache_phase = "none";
+    if (cache.current_phase == DS4_GPU_STREAM_EXPERT_CACHE_PHASE_PREFILL) {
+        cache_phase = "prefill";
+    } else if (cache.current_phase == DS4_GPU_STREAM_EXPERT_CACHE_PHASE_DECODE) {
+        cache_phase = "decode";
+    }
     const uint64_t lookups = m.expert_hits + m.expert_misses;
     const double hit_rate = lookups ? (double)m.expert_hits / (double)lookups : 0.0;
     const double avg_read_ms = m.disk_reads ?
@@ -12817,7 +12875,25 @@ static void send_health(server *s, int fd) {
     buf b = {0};
     buf_printf(&b,
         "{\"status\":\"ok\",\"model\":\"%s\",\"uptime_s\":%.1f,"
-        "\"expert_cache\":{\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f},"
+        "\"expert_cache\":{\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f,"
+        "\"telemetry\":{\"capacity\":%u,\"resident\":%u,\"hits\":%llu,"
+        "\"misses\":%llu,\"admissions\":%llu,\"evictions\":%llu,"
+        "\"phase\":\"%s\",\"request_epoch\":%llu,"
+        "\"layer_quota\":{\"configured\":%s,\"active\":%s,"
+        "\"known_layers\":%u,\"target\":%u,"
+        "\"decode_configured\":%s,\"prefill_armed\":%s,"
+        "\"victims\":%llu,\"decode_victims\":%llu,"
+        "\"same_layer_replacements\":%llu},"
+        "\"prefill\":{\"hits\":%llu,\"misses\":%llu,\"admissions\":%llu,"
+        "\"evictions\":%llu},\"decode\":{\"hits\":%llu,\"misses\":%llu,"
+        "\"admissions\":%llu,\"evictions\":%llu},"
+        "\"prefetch\":{\"requested\":%llu,\"unique\":%llu,"
+        "\"already_resident\":%llu,\"admitted\":%llu,"
+        "\"skipped_full\":%llu,\"useful\":%llu,\"wasted\":%llu,"
+        "\"bytes\":%llu}}},"
+        "\"cuda_decode_graphs\":{\"captures\":%llu,\"replays\":%llu,"
+        "\"failed\":%llu,\"moe_captures\":%llu,"
+        "\"moe_replays\":%llu,\"moe_failed\":%llu},"
         "\"disk\":{\"bytes_read\":%llu,\"reads\":%llu,\"total_read_s\":%.4f,"
         "\"avg_read_ms\":%.3f,\"throughput_mbs\":%.2f,"
         "\"proc_read_bytes\":%llu,\"proc_read_mbs\":%.2f}}\n",
@@ -12826,6 +12902,45 @@ static void send_health(server *s, int fd) {
         (unsigned long long)m.expert_hits,
         (unsigned long long)m.expert_misses,
         hit_rate,
+        cache.capacity,
+        cache.resident,
+        (unsigned long long)cache.hits,
+        (unsigned long long)cache.misses,
+        (unsigned long long)cache.admissions,
+        (unsigned long long)cache.evictions,
+        cache_phase,
+        (unsigned long long)cache.request_epoch,
+        cache.layer_quota_configured ? "true" : "false",
+        cache.layer_quota_active ? "true" : "false",
+        cache.layer_quota_known_layers,
+        cache.layer_quota_target,
+        cache.layer_quota_decode_configured ? "true" : "false",
+        cache.layer_quota_prefill_armed ? "true" : "false",
+        (unsigned long long)cache.layer_quota_victims,
+        (unsigned long long)cache.layer_quota_decode_victims,
+        (unsigned long long)cache.layer_quota_same_layer_replacements,
+        (unsigned long long)cache.prefill_hits,
+        (unsigned long long)cache.prefill_misses,
+        (unsigned long long)cache.prefill_admissions,
+        (unsigned long long)cache.prefill_evictions,
+        (unsigned long long)cache.decode_hits,
+        (unsigned long long)cache.decode_misses,
+        (unsigned long long)cache.decode_admissions,
+        (unsigned long long)cache.decode_evictions,
+        (unsigned long long)cache.prefetch_requested,
+        (unsigned long long)cache.prefetch_unique,
+        (unsigned long long)cache.prefetch_already_resident,
+        (unsigned long long)cache.prefetch_admitted,
+        (unsigned long long)cache.prefetch_skipped_full,
+        (unsigned long long)cache.prefetch_useful,
+        (unsigned long long)cache.prefetch_wasted,
+        (unsigned long long)cache.prefetch_bytes,
+        (unsigned long long)decode_graphs.captures,
+        (unsigned long long)decode_graphs.replays,
+        (unsigned long long)decode_graphs.failed,
+        (unsigned long long)decode_graphs.moe_captures,
+        (unsigned long long)decode_graphs.moe_replays,
+        (unsigned long long)decode_graphs.moe_failed,
         (unsigned long long)m.disk_bytes,
         (unsigned long long)m.disk_reads,
         m.disk_read_s,
@@ -12851,6 +12966,44 @@ static void send_profile(server *s, int fd) {
     buf_puts(&b, "]}\n");
     http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
+}
+
+static void send_experts(server *s, int fd) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const uint32_t cap = 128u * 512u;
+    ds4_gpu_expert_map_entry *entries = xmalloc(
+        (size_t)cap * sizeof(*entries));
+    uint32_t layers = 0, experts = 0;
+    const uint32_t n = ds4_gpu_stream_expert_cache_map_snapshot(
+        entries, cap, &layers, &experts);
+    buf b = {0};
+    buf_printf(&b, "{\"layers\":%u,\"experts_per_layer\":%u,\"resident\":[",
+               layers, experts);
+    bool first = true;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!entries[i].resident || experts == 0) continue;
+        if (!first) buf_putc(&b, ',');
+        buf_printf(&b, "%u", entries[i].layer * experts + entries[i].expert);
+        first = false;
+    }
+    buf_puts(&b, "],\"heat\":[");
+    first = true;
+    for (uint32_t i = 0; i < n; i++) {
+        if (entries[i].accesses == 0) continue;
+        if (!first) buf_putc(&b, ',');
+        buf_printf(&b, "[%u,%u,%llu]",
+                   entries[i].layer, entries[i].expert,
+                   (unsigned long long)entries[i].accesses);
+        first = false;
+    }
+    buf_puts(&b, "]}\n");
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    free(entries);
+#else
+    http_response(fd, s->enable_cors, 200, "application/json",
+                  "{\"layers\":0,\"experts_per_layer\":0,\"resident\":[],\"heat\":[]}\n");
+#endif
 }
 
 /* One JSON snapshot per second over SSE, using the same send path as the
@@ -13007,8 +13160,47 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/admin/status")) {
+        if (!s->allow_web_control) http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        else send_admin_status(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/admin/start")) {
+        if (!s->allow_web_control) http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        else {
+            server_set_inference_enabled(s, true);
+            send_admin_status(s, fd);
+        }
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/admin/stop")) {
+        if (!s->allow_web_control) http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        else {
+            server_set_inference_enabled(s, false);
+            send_admin_status(s, fd);
+        }
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/admin/restart")) {
+        if (!s->allow_web_control) http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        else {
+            http_response(fd, s->enable_cors, 202, "application/json",
+                          "{\"state\":\"restarting\"}\n");
+            request_process_restart();
+        }
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/profile")) {
         send_profile(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/experts")) {
+        send_experts(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -13030,6 +13222,13 @@ static void *client_main(void *arg) {
         server_model_alias_known(hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!server_inference_enabled(s)) {
+        http_error(fd, s->enable_cors, 503,
+                   "inference is stopped; use Start server in the web UI");
         http_request_free(&hr);
         goto done;
     }
@@ -13595,6 +13794,8 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.allow_web_control = !strcmp(cfg.host, "127.0.0.1") || !strcmp(cfg.host, "localhost");
+    s.inference_enabled = true;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -13775,6 +13976,13 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
+    if (g_restart_requested) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: restarting with the original command line");
+        execv("/proc/self/exe", argv);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: restart failed: %s", strerror(errno));
+        return 1;
+    }
     return 0;
 }
 #else

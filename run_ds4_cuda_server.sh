@@ -8,8 +8,10 @@ export CUDA_HOME="${CUDA_HOME:-/home/peppe200175/.local/cuda-13.3.1}"
 export PATH="$CUDA_HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64"
 
-# Correctness-tested RTX 5080 profile. The persistent expert cache is filled
-# only after the established sequential SSD loader has produced valid data.
+# Correctness-tested RTX 5080 profile. The 8 GiB total expert budget reserves
+# the backend-required prefill workspace first and gives the remainder to the
+# persistent decode cache. The cache is populated only after the established
+# sequential SSD loader has produced valid data.
 export DS4_CUDA_MMQ="${DS4_CUDA_MMQ:-0}"
 export DS4_CUDA_NO_Q8_F16_CACHE=1
 export DS4_CUDA_WEIGHT_ARENA_CHUNK_MB="${DS4_CUDA_WEIGHT_ARENA_CHUNK_MB:-256}"
@@ -25,6 +27,7 @@ export DS4_CUDA_STREAMING_PERSISTENT_READERS="${DS4_CUDA_STREAMING_PERSISTENT_RE
 export DS4_CUDA_STREAMING_NUMA_AFFINITY="${DS4_CUDA_STREAMING_NUMA_AFFINITY:-1}"
 export DS4_CUDA_DECODE_CACHE_LRU="${DS4_CUDA_DECODE_CACHE_LRU:-1}"
 export DS4_CUDA_DYNAMIC_TIER_PROMOTION="${DS4_CUDA_DYNAMIC_TIER_PROMOTION:-1}"
+export DS4_CUDA_EXPERT_MAP="${DS4_CUDA_EXPERT_MAP:-1}"
 
 exec ./ds4-server \
     --cuda \
@@ -33,6 +36,9 @@ exec ./ds4-server \
     --ssd-streaming-cache-experts "${DS4_SERVER_EXPERT_CACHE:-7GB}" \
     --prefill-chunk "${DS4_SERVER_PREFILL_CHUNK:-1024}" \
     --ctx "${DS4_SERVER_CTX:-135168}" \
+    --kv-disk-dir "${DS4_SERVER_KV_DIR:-$script_dir/.cache/server-kv}" \
+    --kv-disk-space-mb "${DS4_SERVER_KV_CACHE_MB:-4096}" \
+    --kv-cache-min-tokens "${DS4_SERVER_KV_MIN_TOKENS:-16}" \
     --host "${DS4_SERVER_HOST:-127.0.0.1}" \
     --port "${DS4_SERVER_PORT:-18099}" \
     --cors \

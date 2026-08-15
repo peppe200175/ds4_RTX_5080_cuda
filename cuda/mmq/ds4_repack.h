@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include <cuda_runtime_api.h>
+
 struct ds4_repack_file {
     int fd = -1;
     int direct_fd = -1;
@@ -105,6 +107,16 @@ void ds4_repack_set_threads(int n);
 void ds4_repack_set_hash(bool on);
 
 uint64_t ds4_repack_fnv1a(const unsigned char *p, uint64_t n, uint64_t h);
+
+/* Repack one already-resident raw expert into caller-owned aligned sections.
+ * These are the bounded admission primitives used by SSD streaming: they do
+ * not allocate, synchronize, or retain the raw source. */
+bool ds4_repack_iq2_xxs_aligned_into(
+        const void *raw, void *dq, void *qs, uint64_t nblk,
+        cudaStream_t stream);
+bool ds4_repack_q2_k_aligned_into(
+        const void *raw, void *dm, void *sc, void *qs,
+        uint32_t rows, uint32_t cols, cudaStream_t stream);
 
 /* Build every candidate's aligned artifact.  On success appends the built
  * artifacts to out, adds their byte total to *repacked_bytes_out (may be
